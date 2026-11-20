@@ -1,10 +1,31 @@
-/target
-/backend/target
-/_verify
+# Build artifacts
+target/
+backend/target/
+_verify/
+
+# AI Agent metadata & indexing
 /.agents
 /.codegraph
+
+# SQLite database & journal files
 *.db
 *.db-wal
 *.db-shm
 *.db-journal
-.env*
+
+# Environment configuration
+.env
+.env.*
+!.env.example
+
+# IDE & editor configuration
+.idea/
+.vscode/
+*.swp
+*~
+
+# OS Clutter
+.DS_Store
+Thumbs.db
+ehthumbs.db
+desktop.ini
