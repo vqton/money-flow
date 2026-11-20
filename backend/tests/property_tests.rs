@@ -1,7 +1,10 @@
 use backend::{
+    compute_request_hash,
     database::LedgerRepository,
+    dto::{CreateVoucherLineRequest, CreateVoucherRequest},
     ledger::{AccountingError, LedgerEngine},
     models::{BalanceSheetReport, JournalVoucher, VoucherLine, VoucherStatus},
+    validate_idempotency_key,
 };
 use chrono::NaiveDate;
 use proptest::prelude::*;
@@ -225,5 +228,84 @@ proptest! {
         prop_assert_eq!(bs.total_resources, bs.liabilities + bs.equity);
         prop_assert_eq!(bs.total_assets, bs.total_resources);
         prop_assert!(bs.is_balanced);
+    }
+}
+
+// Property 4: Idempotency Key Format & Validation Invariant
+// - Any string whose trimmed length is in 1..=255 and consists of printable ASCII (32..=126) passes validation.
+// - Any string with trimmed length == 0 or > 255 strictly fails validation.
+// - Any string containing non-printable or control characters strictly fails validation.
+// - The validator never panics on arbitrary string input.
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(500))]
+
+    #[test]
+    fn prop_idempotency_key_validation_invariant(raw_key in "\\PC*") {
+        let trimmed = raw_key.trim();
+        let is_valid_len = !trimmed.is_empty() && trimmed.len() <= 255;
+        let is_ascii_printable = trimmed.chars().all(|c| c.is_ascii_graphic() || c == ' ');
+
+        let res = validate_idempotency_key(&raw_key);
+        if is_valid_len && is_ascii_printable {
+            prop_assert!(res.is_ok());
+            prop_assert_eq!(res.unwrap(), trimmed);
+        } else {
+            prop_assert!(res.is_err());
+        }
+    }
+}
+
+// Property 5: Request Payload Hashing Determinism and Perturbation Sensitivity
+// - For any randomized valid voucher payload: H(req) == H(req).
+// - Perturbing amount strictly produces H(req') != H(req).
+// - Perturbing description strictly produces H(req'') != H(req).
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(300))]
+
+    #[test]
+    fn prop_payload_hashing_determinism_and_perturbation_sensitivity(
+        amt in 1..50_000_000i64,
+        delta in 1..10_000i64,
+        desc in "[a-zA-Z0-9 ]{5,30}",
+    ) {
+        let req1 = CreateVoucherRequest {
+            voucher_no: "PROP-HASH-01".to_string(),
+            voucher_date: NaiveDate::from_ymd_opt(2026, 2, 15).unwrap(),
+            description: desc.clone(),
+            invoice_ref: None,
+            created_by: Some("prop_actor".to_string()),
+            approved_by: None,
+            lines: vec![
+                CreateVoucherLineRequest {
+                    account_code: "1111".to_string(),
+                    debit: Decimal::from(amt),
+                    credit: Decimal::ZERO,
+                    line_desc: None,
+                },
+                CreateVoucherLineRequest {
+                    account_code: "1121".to_string(),
+                    debit: Decimal::ZERO,
+                    credit: Decimal::from(amt),
+                    line_desc: None,
+                },
+            ],
+        };
+
+        let hash1 = compute_request_hash(&req1).unwrap();
+        let hash1_repeat = compute_request_hash(&req1).unwrap();
+        prop_assert_eq!(&hash1, &hash1_repeat);
+
+        // Perturb amount
+        let mut req2 = req1.clone();
+        req2.lines[0].debit = Decimal::from(amt + delta);
+        req2.lines[1].credit = Decimal::from(amt + delta);
+        let hash2 = compute_request_hash(&req2).unwrap();
+        prop_assert_ne!(&hash1, &hash2);
+
+        // Perturb description
+        let mut req3 = req1.clone();
+        req3.description = format!("{}_alt", desc);
+        let hash3 = compute_request_hash(&req3).unwrap();
+        prop_assert_ne!(&hash1, &hash3);
     }
 }

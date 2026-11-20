@@ -4,7 +4,9 @@ use rust_decimal::Decimal;
 /// Core business error domain for accounting invariant violations.
 #[derive(Debug, PartialEq, thiserror::Error)]
 pub enum AccountingError {
-    #[error("Voucher {voucher_no} is unbalanced: total debit ({total_debit}) != total credit ({total_credit})")]
+    #[error(
+        "Voucher {voucher_no} is unbalanced: total debit ({total_debit}) != total credit ({total_credit})"
+    )]
     UnbalancedVoucher {
         voucher_no: String,
         total_debit: Decimal,
@@ -50,6 +52,9 @@ pub enum AccountingError {
 
     #[error("Voucher with id '{0}' not found")]
     VoucherNotFound(String),
+
+    #[error("Idempotency key '{key}' already exists with a different request payload")]
+    IdempotencyConflict { key: String },
 
     #[error("Database error: {0}")]
     DatabaseError(String),

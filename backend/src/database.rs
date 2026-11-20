@@ -1,16 +1,25 @@
 use crate::dto::TrialBalanceRow;
 use crate::ledger::AccountingError;
 use crate::models::{
-    AccountingPeriod, AuditLogEntry, BalanceSheetReport, IncomeStatementReport, JournalVoucher,
-    VoucherLine, VoucherStatus,
+    AccountingPeriod, AuditLogEntry, BalanceSheetReport, IdempotencyRecord, IncomeStatementReport,
+    JournalVoucher, VoucherLine, VoucherStatus,
 };
 use chrono::{Datelike, NaiveDate};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use rust_decimal::Decimal;
 use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
+
+/// Result outcome of saving a voucher with idempotency tracking.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SaveVoucherOutcome {
+    /// Fresh voucher created and persisted.
+    Created(JournalVoucher),
+    /// Replayed from existing idempotency record.
+    Replayed(JournalVoucher),
+}
 
 /// Thread-safe SQLite repository managing audit-grade persistence of vouchers and ledger lines.
 #[derive(Clone)]
@@ -57,6 +66,24 @@ impl LedgerRepository {
             [],
         )?;
 
+        // Forward-compatible schema migration: add missing columns if opening an older database file
+        let _ = conn.execute(
+            "ALTER TABLE vouchers ADD COLUMN status TEXT NOT NULL DEFAULT 'POSTED';",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE vouchers ADD COLUMN created_by TEXT NOT NULL DEFAULT 'system';",
+            [],
+        );
+        let _ = conn.execute("ALTER TABLE vouchers ADD COLUMN approved_by TEXT;", []);
+        let _ = conn.execute("ALTER TABLE vouchers ADD COLUMN voided_at TEXT;", []);
+        let _ = conn.execute("ALTER TABLE vouchers ADD COLUMN voided_by TEXT;", []);
+        let _ = conn.execute("ALTER TABLE vouchers ADD COLUMN void_reason TEXT;", []);
+        let _ = conn.execute(
+            "ALTER TABLE vouchers ADD COLUMN created_at TEXT NOT NULL DEFAULT (datetime('now'));",
+            [],
+        );
+
         // 2. Voucher Lines Table (Các định khoản Nợ / Có) with Explicit Leg Sequence Order
         conn.execute(
             "CREATE TABLE IF NOT EXISTS voucher_lines (
@@ -70,6 +97,11 @@ impl LedgerRepository {
             );",
             [],
         )?;
+
+        let _ = conn.execute(
+            "ALTER TABLE voucher_lines ADD COLUMN line_no INTEGER NOT NULL DEFAULT 1;",
+            [],
+        );
 
         // 3. Accounting Periods Table (Period Lock & Statutory Status)
         conn.execute(
@@ -134,6 +166,102 @@ impl LedgerRepository {
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_logs(timestamp);",
             [],
+        )?;
+
+        // 6. Idempotency Records Table (API Request Deduplication & Replay)
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS idempotency_records (
+                key TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                endpoint TEXT NOT NULL,
+                request_hash TEXT NOT NULL,
+                status_code INTEGER NOT NULL,
+                response_body TEXT NOT NULL,
+                resource_id TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (key, actor, endpoint)
+            );",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_idempotency_actor ON idempotency_records(actor);",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_idempotency_created_at ON idempotency_records(created_at);",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_idempotency_resource ON idempotency_records(resource_id);",
+            [],
+        )?;
+
+        // 7. Database Immutability Triggers (Financial Integrity & Non-Destructive Lifecycle)
+        conn.execute_batch(
+            "
+            -- Audit logs: Strict append-only; updates and deletes prohibited
+            CREATE TRIGGER IF NOT EXISTS trg_audit_logs_no_update
+            BEFORE UPDATE ON audit_logs
+            BEGIN
+                SELECT RAISE(ABORT, 'audit_logs are immutable: UPDATE not permitted');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_audit_logs_no_delete
+            BEFORE DELETE ON audit_logs
+            BEGIN
+                SELECT RAISE(ABORT, 'audit_logs are immutable: DELETE not permitted');
+            END;
+
+            -- Idempotency records: Strict write-once; updates and deletes prohibited
+            CREATE TRIGGER IF NOT EXISTS trg_idempotency_records_no_update
+            BEFORE UPDATE ON idempotency_records
+            BEGIN
+                SELECT RAISE(ABORT, 'idempotency_records are immutable: UPDATE not permitted');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_idempotency_records_no_delete
+            BEFORE DELETE ON idempotency_records
+            BEGIN
+                SELECT RAISE(ABORT, 'idempotency_records are immutable: DELETE not permitted');
+            END;
+
+            -- Voucher lines: Immutable transaction legs; updates and deletes prohibited
+            CREATE TRIGGER IF NOT EXISTS trg_voucher_lines_no_delete
+            BEFORE DELETE ON voucher_lines
+            BEGIN
+                SELECT RAISE(ABORT, 'voucher_lines are immutable: DELETE not permitted');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_voucher_lines_no_update
+            BEFORE UPDATE ON voucher_lines
+            BEGIN
+                SELECT RAISE(ABORT, 'voucher_lines are immutable: UPDATE not permitted');
+            END;
+
+            -- Vouchers: No physical deletion; updates restricted exclusively to voiding transitions
+            CREATE TRIGGER IF NOT EXISTS trg_vouchers_no_delete
+            BEFORE DELETE ON vouchers
+            BEGIN
+                SELECT RAISE(ABORT, 'vouchers are immutable: DELETE not permitted');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_vouchers_protect_update
+            BEFORE UPDATE ON vouchers
+            FOR EACH ROW
+            WHEN OLD.status != 'POSTED'
+              OR NEW.status != 'VOIDED'
+              OR NEW.id IS NOT OLD.id
+              OR NEW.voucher_no IS NOT OLD.voucher_no
+              OR NEW.voucher_date IS NOT OLD.voucher_date
+              OR NEW.description IS NOT OLD.description
+              OR NEW.invoice_ref IS NOT OLD.invoice_ref
+              OR NEW.created_by IS NOT OLD.created_by
+              OR NEW.approved_by IS NOT OLD.approved_by
+              OR NEW.created_at IS NOT OLD.created_at
+            BEGIN
+                SELECT RAISE(ABORT, 'vouchers are immutable: only voiding transitions (status, voided_at, voided_by, void_reason) of POSTED vouchers are permitted');
+            END;
+            ",
         )?;
 
         Ok(())
@@ -208,12 +336,80 @@ impl LedgerRepository {
         Ok(())
     }
 
-    /// Persists a complete JournalVoucher (header + all debit/credit lines)
-    /// within a single ACID transaction. Rejects posting if the period is closed.
-    /// Also records an immutable CREATE_VOUCHER audit trail event.
-    pub fn save_voucher(&self, voucher: &JournalVoucher) -> Result<(), AccountingError> {
+    /// Retrieves an idempotency record by key, actor, and endpoint.
+    pub fn get_idempotency_record(
+        &self,
+        key: &str,
+        actor: &str,
+        endpoint: &str,
+    ) -> Result<Option<IdempotencyRecord>, AccountingError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT key, actor, endpoint, request_hash, status_code, response_body, resource_id, created_at
+             FROM idempotency_records
+             WHERE key = ?1 AND actor = ?2 AND endpoint = ?3",
+        )?;
+        let record = stmt
+            .query_row(params![key, actor, endpoint], |row| {
+                let status_raw: i64 = row.get(4)?;
+                Ok(IdempotencyRecord {
+                    key: row.get(0)?,
+                    actor: row.get(1)?,
+                    endpoint: row.get(2)?,
+                    request_hash: row.get(3)?,
+                    status_code: status_raw as u16,
+                    response_body: row.get(5)?,
+                    resource_id: row.get(6)?,
+                    created_at: row.get(7)?,
+                })
+            })
+            .optional()?;
+        Ok(record)
+    }
+
+    /// Persists a complete JournalVoucher (header + lines) with optional idempotency tracking.
+    /// Within a single ACID transaction:
+    /// 1. Checks if an idempotency record exists for (key, actor, endpoint):
+    ///    - If matching hash: returns Replayed(voucher).
+    ///    - If mismatched hash: returns Err(AccountingError::IdempotencyConflict).
+    /// 2. Enforces period lock.
+    /// 3. Inserts voucher header and legs.
+    /// 4. Records CREATE_VOUCHER audit log.
+    /// 5. Inserts idempotency record if key was provided.
+    /// 6. Commits transaction and returns Created(voucher).
+    pub fn save_voucher_with_idempotency(
+        &self,
+        voucher: &JournalVoucher,
+        idempotency: Option<(&str, &str, &str, &str)>, // (key, actor, endpoint, request_hash)
+    ) -> Result<SaveVoucherOutcome, AccountingError> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
+
+        if let Some((key, actor, endpoint, request_hash)) = idempotency {
+            let existing: Option<(String, i64, String)> = tx
+                .query_row(
+                    "SELECT request_hash, status_code, response_body
+                     FROM idempotency_records
+                     WHERE key = ?1 AND actor = ?2 AND endpoint = ?3",
+                    params![key, actor, endpoint],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+
+            if let Some((saved_hash, _status, body)) = existing {
+                if saved_hash == request_hash {
+                    let replayed_voucher: JournalVoucher =
+                        serde_json::from_str(&body).map_err(|e| {
+                            AccountingError::DatabaseError(format!("Corrupt idempotency body: {e}"))
+                        })?;
+                    return Ok(SaveVoucherOutcome::Replayed(replayed_voucher));
+                } else {
+                    return Err(AccountingError::IdempotencyConflict {
+                        key: key.to_string(),
+                    });
+                }
+            }
+        }
 
         let year = voucher.voucher_date.year();
         let month = voucher.voucher_date.month();
@@ -250,7 +446,37 @@ impl LedgerRepository {
         };
         Self::record_audit_log_tx(&tx, &audit)?;
 
+        if let Some((key, actor, endpoint, request_hash)) = idempotency {
+            let response_body = serde_json::to_string(voucher).map_err(|e| {
+                AccountingError::DatabaseError(format!("Failed to serialize voucher response: {e}"))
+            })?;
+            let now = chrono::Utc::now().to_rfc3339();
+            tx.execute(
+                "INSERT INTO idempotency_records (key, actor, endpoint, request_hash, status_code, response_body, resource_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    key,
+                    actor,
+                    endpoint,
+                    request_hash,
+                    201i64,
+                    response_body,
+                    voucher.id.to_string(),
+                    now,
+                ],
+            )?;
+        }
+
         tx.commit()?;
+        Ok(SaveVoucherOutcome::Created(voucher.clone()))
+    }
+
+    /// Persists a complete JournalVoucher (header + all debit/credit lines)
+    /// within a single ACID transaction. Rejects posting if the period is closed.
+    /// Also records an immutable CREATE_VOUCHER audit trail event.
+    /// Delegates to `save_voucher_with_idempotency(voucher, None)`.
+    pub fn save_voucher(&self, voucher: &JournalVoucher) -> Result<(), AccountingError> {
+        self.save_voucher_with_idempotency(voucher, None)?;
         Ok(())
     }
 
@@ -330,7 +556,7 @@ impl LedgerRepository {
     /// Atomically reopens a closed accounting period via statutory non-destructive voiding:
     /// marks the closing voucher as VOIDED (preserving historical audit trails),
     /// resets `is_closed` to false, and records a PERIOD_REOPEN audit event.
-    pub fn reopen_period(&self, year: i32, month: u32) -> Result<(), AccountingError> {
+    pub fn reopen_period(&self, year: i32, month: u32, actor: &str) -> Result<(), AccountingError> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
 
@@ -355,10 +581,10 @@ impl LedgerRepository {
             "UPDATE vouchers
              SET status = 'VOIDED',
                  voided_at = ?1,
-                 voided_by = 'system',
+                 voided_by = ?2,
                  void_reason = 'Period reopened'
-             WHERE voucher_no = ?2 AND status = 'POSTED'",
-            params![now, closing_voucher_no],
+             WHERE voucher_no = ?3 AND status = 'POSTED'",
+            params![now, actor, closing_voucher_no],
         )?;
 
         // Set period as open
@@ -372,7 +598,7 @@ impl LedgerRepository {
         let audit = AuditLogEntry {
             id: Uuid::new_v4(),
             timestamp: now,
-            actor: "system".to_string(),
+            actor: actor.to_string(),
             action: "PERIOD_REOPEN".to_string(),
             resource_type: "PERIOD".to_string(),
             resource_id: Some(format!("{year}-{month:02}")),
@@ -477,8 +703,10 @@ impl LedgerRepository {
     ) -> Result<Vec<AuditLogEntry>, AccountingError> {
         let conn = self.conn.lock().unwrap();
 
-        let mut sql = "SELECT id, timestamp, actor, action, resource_type, resource_id, details, client_ip
-                       FROM audit_logs WHERE 1=1".to_string();
+        let mut sql =
+            "SELECT id, timestamp, actor, action, resource_type, resource_id, details, client_ip
+                       FROM audit_logs WHERE 1=1"
+                .to_string();
         let mut params_vec: Vec<rusqlite::types::Value> = Vec::new();
 
         if let Some(ref actor) = query.actor {
@@ -515,7 +743,11 @@ impl LedgerRepository {
         let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), |row| {
             let id_str: String = row.get(0)?;
             let id = Uuid::parse_str(&id_str).map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
             })?;
             let timestamp: String = row.get(1)?;
             let actor: String = row.get(2)?;
@@ -601,10 +833,18 @@ impl LedgerRepository {
             let credit_str: String = row.get(2)?;
 
             let debit = Decimal::from_str(&debit_str).map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(e))
+                rusqlite::Error::FromSqlConversionFailure(
+                    1,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
             })?;
             let credit = Decimal::from_str(&credit_str).map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e))
+                rusqlite::Error::FromSqlConversionFailure(
+                    2,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
             })?;
 
             Ok((account_code, debit, credit))
@@ -613,7 +853,9 @@ impl LedgerRepository {
         let mut map = BTreeMap::new();
         for r in rows {
             let (account_code, debit, credit) = r?;
-            let entry = map.entry(account_code).or_insert((Decimal::ZERO, Decimal::ZERO));
+            let entry = map
+                .entry(account_code)
+                .or_insert((Decimal::ZERO, Decimal::ZERO));
             entry.0 += debit;
             entry.1 += credit;
         }
@@ -644,10 +886,18 @@ impl LedgerRepository {
             let credit_str: String = row.get(2)?;
 
             let debit = Decimal::from_str(&debit_str).map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(e))
+                rusqlite::Error::FromSqlConversionFailure(
+                    1,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
             })?;
             let credit = Decimal::from_str(&credit_str).map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e))
+                rusqlite::Error::FromSqlConversionFailure(
+                    2,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
             })?;
 
             Ok((account_code, debit, credit))
@@ -686,7 +936,8 @@ impl LedgerRepository {
             }
         }
 
-        let total_assets = current_assets + non_current_assets - (accumulated_depreciation + asset_provisions);
+        let total_assets =
+            current_assets + non_current_assets - (accumulated_depreciation + asset_provisions);
         let total_resources = liabilities + equity;
         let is_balanced = total_assets == total_resources;
 
@@ -731,10 +982,18 @@ impl LedgerRepository {
             let credit_str: String = row.get(2)?;
 
             let debit = Decimal::from_str(&debit_str).map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(e))
+                rusqlite::Error::FromSqlConversionFailure(
+                    1,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
             })?;
             let credit = Decimal::from_str(&credit_str).map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e))
+                rusqlite::Error::FromSqlConversionFailure(
+                    2,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
             })?;
 
             Ok((account_code, debit, credit))
@@ -830,11 +1089,20 @@ impl LedgerRepository {
                 let created_at: String = row.get(11)?;
 
                 let parsed_id = Uuid::parse_str(&id_str).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
                 })?;
-                let parsed_date = NaiveDate::parse_from_str(&date_str, "%Y-%m-%d").map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e))
-                })?;
+                let parsed_date =
+                    NaiveDate::parse_from_str(&date_str, "%Y-%m-%d").map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?;
                 let status = VoucherStatus::from_str(&status_str).map_err(|e| {
                     rusqlite::Error::FromSqlConversionFailure(
                         5,
@@ -894,13 +1162,25 @@ impl LedgerRepository {
             let line_desc: Option<String> = row.get(5)?;
 
             let line_id = Uuid::parse_str(&line_id_str).map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
             })?;
             let debit = Decimal::from_str(&debit_str).map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(e))
+                rusqlite::Error::FromSqlConversionFailure(
+                    3,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
             })?;
             let credit = Decimal::from_str(&credit_str).map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(e))
+                rusqlite::Error::FromSqlConversionFailure(
+                    4,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
             })?;
 
             Ok(VoucherLine {
@@ -971,10 +1251,18 @@ impl LedgerRepository {
             let created_at: String = row.get(11)?;
 
             let parsed_id = Uuid::parse_str(&id_str).map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
             })?;
             let parsed_date = NaiveDate::parse_from_str(&date_str, "%Y-%m-%d").map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e))
+                rusqlite::Error::FromSqlConversionFailure(
+                    2,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
             })?;
             let status = VoucherStatus::from_str(&status_str).map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
@@ -1036,13 +1324,25 @@ impl LedgerRepository {
                 let line_desc: Option<String> = row.get(5)?;
 
                 let line_id = Uuid::parse_str(&line_id_str).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
                 })?;
                 let debit = Decimal::from_str(&debit_str).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(e))
+                    rusqlite::Error::FromSqlConversionFailure(
+                        3,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
                 })?;
                 let credit = Decimal::from_str(&credit_str).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(e))
+                    rusqlite::Error::FromSqlConversionFailure(
+                        4,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
                 })?;
 
                 Ok(VoucherLine {
@@ -1100,10 +1400,18 @@ impl LedgerRepository {
             let credit_str: String = row.get(2)?;
 
             let debit = Decimal::from_str(&debit_str).map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(e))
+                rusqlite::Error::FromSqlConversionFailure(
+                    1,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
             })?;
             let credit = Decimal::from_str(&credit_str).map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e))
+                rusqlite::Error::FromSqlConversionFailure(
+                    2,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
             })?;
 
             Ok((account_code, debit, credit))
@@ -1137,7 +1445,11 @@ impl LedgerRepository {
     /// Creates an atomic live SQLite snapshot using `VACUUM INTO ?1`.
     /// Handles stale existing files, ensures parent directories exist,
     /// records a SYSTEM_BACKUP audit log event, and returns the backup file size in bytes.
-    pub fn create_backup(&self, destination_path: &str) -> Result<u64, AccountingError> {
+    pub fn create_backup(
+        &self,
+        destination_path: &str,
+        actor: &str,
+    ) -> Result<u64, AccountingError> {
         if destination_path.trim().is_empty() {
             return Err(AccountingError::DatabaseError(
                 "Destination path cannot be empty".to_string(),
@@ -1147,19 +1459,13 @@ impl LedgerRepository {
         let dest = std::path::Path::new(destination_path);
         if let Some(parent) = dest.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent).map_err(|e| {
-                AccountingError::DatabaseError(format!(
-                    "Failed to create backup directory: {}",
-                    e
-                ))
+                AccountingError::DatabaseError(format!("Failed to create backup directory: {}", e))
             })?;
         }
 
         if dest.exists() {
             std::fs::remove_file(dest).map_err(|e| {
-                AccountingError::DatabaseError(format!(
-                    "Failed to remove stale backup file: {}",
-                    e
-                ))
+                AccountingError::DatabaseError(format!("Failed to remove stale backup file: {}", e))
             })?;
         }
 
@@ -1167,10 +1473,7 @@ impl LedgerRepository {
         conn.execute("VACUUM INTO ?1;", params![destination_path])?;
 
         let metadata = std::fs::metadata(destination_path).map_err(|e| {
-            AccountingError::DatabaseError(format!(
-                "Failed to read backup file metadata: {}",
-                e
-            ))
+            AccountingError::DatabaseError(format!("Failed to read backup file metadata: {}", e))
         })?;
 
         let file_size_bytes = metadata.len();
@@ -1182,7 +1485,7 @@ impl LedgerRepository {
             params![
                 Uuid::new_v4().to_string(),
                 chrono::Utc::now().to_rfc3339(),
-                "system",
+                actor,
                 "SYSTEM_BACKUP",
                 "SYSTEM",
                 destination_path,
@@ -1404,10 +1707,7 @@ mod tests {
 
         // 3. Filter from Jan 15 onwards -> v2 and v3
         let from_jan15 = repo
-            .list_vouchers(
-                Some(NaiveDate::from_ymd_opt(2026, 1, 15).unwrap()),
-                None,
-            )
+            .list_vouchers(Some(NaiveDate::from_ymd_opt(2026, 1, 15).unwrap()), None)
             .unwrap();
         assert_eq!(from_jan15.len(), 2);
     }
@@ -1576,17 +1876,18 @@ mod tests {
         );
 
         // Reopen period
-        repo.reopen_period(2026, 1).unwrap();
+        repo.reopen_period(2026, 1, "chief_controller").unwrap();
         assert!(!repo.is_period_closed(2026, 1).unwrap());
 
         // Verify closing voucher is now VOIDED and still present
         let voided_kc = repo.get_voucher(closing_voucher.id).unwrap().unwrap();
         assert_eq!(voided_kc.status, VoucherStatus::Voided);
         assert_eq!(voided_kc.void_reason, Some("Period reopened".to_string()));
+        assert_eq!(voided_kc.voided_by, Some("chief_controller".to_string()));
 
         // Reopen again returns PeriodNotClosed
         assert_eq!(
-            repo.reopen_period(2026, 1).unwrap_err(),
+            repo.reopen_period(2026, 1, "chief_controller").unwrap_err(),
             AccountingError::PeriodNotClosed {
                 year: 2026,
                 month: 1
@@ -1645,11 +1946,19 @@ mod tests {
 
         // Void the voucher
         let voided = repo
-            .void_voucher(v_id, "cfo_minh", "Duplicate transaction entry", Some("127.0.0.1"))
+            .void_voucher(
+                v_id,
+                "cfo_minh",
+                "Duplicate transaction entry",
+                Some("127.0.0.1"),
+            )
             .unwrap();
         assert_eq!(voided.status, VoucherStatus::Voided);
         assert_eq!(voided.voided_by, Some("cfo_minh".to_string()));
-        assert_eq!(voided.void_reason, Some("Duplicate transaction entry".to_string()));
+        assert_eq!(
+            voided.void_reason,
+            Some("Duplicate transaction entry".to_string())
+        );
 
         // Trial balance excludes it!
         let tb_after = repo.compute_trial_balance().unwrap();
@@ -1657,14 +1966,17 @@ mod tests {
 
         // Cannot void again
         assert_eq!(
-            repo.void_voucher(v_id, "cfo_minh", "Again", None).unwrap_err(),
+            repo.void_voucher(v_id, "cfo_minh", "Again", None)
+                .unwrap_err(),
             AccountingError::VoucherAlreadyVoided {
                 voucher_no: "V-AUDIT-01".to_string()
             }
         );
 
         // Audit logs recorded CREATE_VOUCHER and VOID_VOUCHER
-        let logs = repo.list_audit_logs(&crate::dto::AuditLogQuery::default()).unwrap();
+        let logs = repo
+            .list_audit_logs(&crate::dto::AuditLogQuery::default())
+            .unwrap();
         assert_eq!(logs.len(), 2);
         assert_eq!(logs[0].action, "VOID_VOUCHER");
         assert_eq!(logs[0].actor, "cfo_minh");
@@ -1698,12 +2010,16 @@ mod tests {
         let backup_file = temp_dir.join("snapshot.db");
         let backup_path = backup_file.to_str().unwrap();
 
-        let size = repo.create_backup(backup_path).expect("create_backup should succeed");
+        let size = repo
+            .create_backup(backup_path, "chief_controller")
+            .expect("create_backup should succeed");
         assert!(size > 0);
         assert!(backup_file.exists());
 
         // Test stale file handling (overwriting existing file)
-        let size2 = repo.create_backup(backup_path).expect("create_backup overwrite should succeed");
+        let size2 = repo
+            .create_backup(backup_path, "chief_controller")
+            .expect("create_backup overwrite should succeed");
         assert!(size2 > 0);
 
         // Verify audit log captured SYSTEM_BACKUP
@@ -1718,5 +2034,414 @@ mod tests {
 
         // Clean up
         let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_sqlite_immutability_triggers() {
+        let conn = Connection::open_in_memory().unwrap();
+        let repo = LedgerRepository::new(conn);
+        repo.init_schema().unwrap();
+
+        let v_id = Uuid::new_v4();
+        let voucher = JournalVoucher {
+            id: v_id,
+            voucher_no: "TRG-001".to_string(),
+            voucher_date: NaiveDate::from_ymd_opt(2026, 1, 15).unwrap(),
+            description: "Trigger immutability test".to_string(),
+            invoice_ref: Some("INV-001".to_string()),
+            status: VoucherStatus::Posted,
+            created_by: "accountant_a".to_string(),
+            approved_by: Some("manager_b".to_string()),
+            voided_at: None,
+            voided_by: None,
+            void_reason: None,
+            created_at: "2026-01-15T08:00:00Z".to_string(),
+            lines: vec![
+                VoucherLine {
+                    id: Uuid::new_v4(),
+                    line_no: 1,
+                    account_code: "1111".to_string(),
+                    debit: dec!(1000),
+                    credit: dec!(0),
+                    line_desc: None,
+                },
+                VoucherLine {
+                    id: Uuid::new_v4(),
+                    line_no: 2,
+                    account_code: "1121".to_string(),
+                    debit: dec!(0),
+                    credit: dec!(1000),
+                    line_desc: None,
+                },
+            ],
+        };
+        repo.save_voucher(&voucher).unwrap();
+
+        let raw = repo.conn.lock().unwrap();
+
+        // 1. Audit logs: Raw UPDATE must fail
+        let err = raw
+            .execute("UPDATE audit_logs SET actor = 'attacker'", [])
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("audit_logs are immutable: UPDATE not permitted")
+        );
+
+        // 2. Audit logs: Raw DELETE must fail
+        let err = raw.execute("DELETE FROM audit_logs", []).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("audit_logs are immutable: DELETE not permitted")
+        );
+
+        // 3. Voucher lines: Raw DELETE must fail
+        let err = raw.execute("DELETE FROM voucher_lines", []).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("voucher_lines are immutable: DELETE not permitted")
+        );
+
+        // 4. Voucher lines: Raw UPDATE must fail
+        let err = raw
+            .execute("UPDATE voucher_lines SET debit = '9999'", [])
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("voucher_lines are immutable: UPDATE not permitted")
+        );
+
+        // 5. Vouchers: Raw DELETE must fail
+        let err = raw
+            .execute("DELETE FROM vouchers WHERE id = ?1", [v_id.to_string()])
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("vouchers are immutable: DELETE not permitted")
+        );
+
+        // 6. Vouchers: Raw UPDATE of description on POSTED voucher must fail
+        let err = raw
+            .execute(
+                "UPDATE vouchers SET description = 'tampered' WHERE id = ?1",
+                [v_id.to_string()],
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("vouchers are immutable: only voiding transitions")
+        );
+
+        // 7. Vouchers: Raw UPDATE altering date during void must fail
+        let err = raw
+            .execute(
+                "UPDATE vouchers SET status = 'VOIDED', voucher_date = '2026-02-01' WHERE id = ?1",
+                [v_id.to_string()],
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("vouchers are immutable: only voiding transitions")
+        );
+
+        drop(raw);
+
+        // 8. Permitted application flow: void_voucher succeeds
+        let voided = repo
+            .void_voucher(v_id, "controller_c", "Valid void test", None)
+            .unwrap();
+        assert_eq!(voided.status, VoucherStatus::Voided);
+
+        // 9. Vouchers: Raw UPDATE on already VOIDED voucher must fail
+        let raw2 = repo.conn.lock().unwrap();
+        let err = raw2
+            .execute(
+                "UPDATE vouchers SET void_reason = 'tampered again' WHERE id = ?1",
+                [v_id.to_string()],
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("vouchers are immutable: only voiding transitions")
+        );
+    }
+
+    #[test]
+    fn test_idempotency_schema_and_immutability_triggers() {
+        let conn = Connection::open_in_memory().unwrap();
+        let repo = LedgerRepository::new(conn);
+        repo.init_schema().unwrap();
+
+        // 1. Insert an idempotency record directly
+        let raw = repo.conn.lock().unwrap();
+        raw.execute(
+            "INSERT INTO idempotency_records (key, actor, endpoint, request_hash, status_code, response_body, resource_id, created_at)
+             VALUES ('key1', 'user1', '/api/v1/vouchers', 'hash1', 201, '{}', 'res1', '2026-02-15T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        // 2. Immutability: Raw UPDATE must fail
+        let err_update = raw
+            .execute(
+                "UPDATE idempotency_records SET request_hash = 'tampered'",
+                [],
+            )
+            .unwrap_err();
+        assert!(
+            err_update
+                .to_string()
+                .contains("idempotency_records are immutable: UPDATE not permitted")
+        );
+
+        // 3. Immutability: Raw DELETE must fail
+        let err_delete = raw
+            .execute("DELETE FROM idempotency_records", [])
+            .unwrap_err();
+        assert!(
+            err_delete
+                .to_string()
+                .contains("idempotency_records are immutable: DELETE not permitted")
+        );
+    }
+
+    #[test]
+    fn test_save_voucher_with_idempotency_lifecycle() {
+        let conn = Connection::open_in_memory().unwrap();
+        let repo = LedgerRepository::new(conn);
+        repo.init_schema().unwrap();
+
+        let v1_id = Uuid::new_v4();
+        let voucher1 = JournalVoucher {
+            id: v1_id,
+            voucher_no: "PKT-UNIT-01".to_string(),
+            voucher_date: NaiveDate::from_ymd_opt(2026, 2, 10).unwrap(),
+            description: "Unit test voucher".to_string(),
+            invoice_ref: None,
+            status: VoucherStatus::Posted,
+            created_by: "accountant_lan".to_string(),
+            approved_by: None,
+            voided_at: None,
+            voided_by: None,
+            void_reason: None,
+            created_at: "2026-02-10T00:00:00Z".to_string(),
+            lines: vec![
+                VoucherLine {
+                    id: Uuid::new_v4(),
+                    line_no: 1,
+                    account_code: "1111".to_string(),
+                    debit: Decimal::from(1000),
+                    credit: Decimal::ZERO,
+                    line_desc: None,
+                },
+                VoucherLine {
+                    id: Uuid::new_v4(),
+                    line_no: 2,
+                    account_code: "1121".to_string(),
+                    debit: Decimal::ZERO,
+                    credit: Decimal::from(1000),
+                    line_desc: None,
+                },
+            ],
+        };
+
+        // 1. First call: Created
+        let outcome1 = repo
+            .save_voucher_with_idempotency(
+                &voucher1,
+                Some((
+                    "key-unit-1",
+                    "accountant_lan",
+                    "/api/v1/vouchers",
+                    "hash-abc",
+                )),
+            )
+            .unwrap();
+        assert!(matches!(outcome1, SaveVoucherOutcome::Created(_)));
+
+        // Record exists in DB
+        let rec = repo
+            .get_idempotency_record("key-unit-1", "accountant_lan", "/api/v1/vouchers")
+            .unwrap()
+            .expect("Idempotency record should exist");
+        assert_eq!(rec.request_hash, "hash-abc");
+        assert_eq!(rec.status_code, 201);
+
+        // 2. Replay with identical key and hash: returns Replayed with original voucher
+        let outcome2 = repo
+            .save_voucher_with_idempotency(
+                &voucher1,
+                Some((
+                    "key-unit-1",
+                    "accountant_lan",
+                    "/api/v1/vouchers",
+                    "hash-abc",
+                )),
+            )
+            .unwrap();
+        match outcome2 {
+            SaveVoucherOutcome::Replayed(replayed) => {
+                assert_eq!(replayed.id, v1_id);
+                assert_eq!(replayed.voucher_no, "PKT-UNIT-01");
+            }
+            _ => panic!("Expected Replayed outcome"),
+        }
+
+        // Verify no duplicate voucher in DB
+        let vouchers = repo.list_vouchers(None, None).unwrap();
+        assert_eq!(vouchers.len(), 1);
+
+        // 3. Conflict with same key but different hash: returns AccountingError::IdempotencyConflict
+        let res_conflict = repo.save_voucher_with_idempotency(
+            &voucher1,
+            Some((
+                "key-unit-1",
+                "accountant_lan",
+                "/api/v1/vouchers",
+                "hash-DIFFERENT",
+            )),
+        );
+        assert_eq!(
+            res_conflict.unwrap_err(),
+            AccountingError::IdempotencyConflict {
+                key: "key-unit-1".to_string()
+            }
+        );
+
+        // 4. Multi-actor isolation: different actor with SAME key succeeds
+        let v2_id = Uuid::new_v4();
+        let voucher2 = JournalVoucher {
+            id: v2_id,
+            voucher_no: "PKT-UNIT-02".to_string(),
+            voucher_date: NaiveDate::from_ymd_opt(2026, 2, 10).unwrap(),
+            description: "Second actor voucher".to_string(),
+            invoice_ref: None,
+            status: VoucherStatus::Posted,
+            created_by: "accountant_hoa".to_string(),
+            approved_by: None,
+            voided_at: None,
+            voided_by: None,
+            void_reason: None,
+            created_at: "2026-02-10T00:00:00Z".to_string(),
+            lines: vec![
+                VoucherLine {
+                    id: Uuid::new_v4(),
+                    line_no: 1,
+                    account_code: "1111".to_string(),
+                    debit: Decimal::from(2000),
+                    credit: Decimal::ZERO,
+                    line_desc: None,
+                },
+                VoucherLine {
+                    id: Uuid::new_v4(),
+                    line_no: 2,
+                    account_code: "1121".to_string(),
+                    debit: Decimal::ZERO,
+                    credit: Decimal::from(2000),
+                    line_desc: None,
+                },
+            ],
+        };
+        let outcome_hoa = repo
+            .save_voucher_with_idempotency(
+                &voucher2,
+                Some((
+                    "key-unit-1",
+                    "accountant_hoa",
+                    "/api/v1/vouchers",
+                    "hash-hoa",
+                )),
+            )
+            .unwrap();
+        assert!(matches!(outcome_hoa, SaveVoucherOutcome::Created(_)));
+
+        // Both records exist
+        let rec_lan = repo
+            .get_idempotency_record("key-unit-1", "accountant_lan", "/api/v1/vouchers")
+            .unwrap();
+        let rec_hoa = repo
+            .get_idempotency_record("key-unit-1", "accountant_hoa", "/api/v1/vouchers")
+            .unwrap();
+        assert!(rec_lan.is_some());
+        assert!(rec_hoa.is_some());
+    }
+
+    #[test]
+    fn test_save_voucher_with_idempotency_closed_period_rollback() {
+        let conn = Connection::open_in_memory().unwrap();
+        let repo = LedgerRepository::new(conn);
+        repo.init_schema().unwrap();
+
+        // Close period 2026-04 manually in DB
+        {
+            let raw = repo.conn.lock().unwrap();
+            raw.execute(
+                "INSERT INTO accounting_periods (year, month, is_closed) VALUES (2026, 4, 1)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let voucher = JournalVoucher {
+            id: Uuid::new_v4(),
+            voucher_no: "PKT-CLOSED-01".to_string(),
+            voucher_date: NaiveDate::from_ymd_opt(2026, 4, 15).unwrap(),
+            description: "In closed period".to_string(),
+            invoice_ref: None,
+            status: VoucherStatus::Posted,
+            created_by: "accountant_lan".to_string(),
+            approved_by: None,
+            voided_at: None,
+            voided_by: None,
+            void_reason: None,
+            created_at: "2026-04-15T00:00:00Z".to_string(),
+            lines: vec![
+                VoucherLine {
+                    id: Uuid::new_v4(),
+                    line_no: 1,
+                    account_code: "1111".to_string(),
+                    debit: Decimal::from(1000),
+                    credit: Decimal::ZERO,
+                    line_desc: None,
+                },
+                VoucherLine {
+                    id: Uuid::new_v4(),
+                    line_no: 2,
+                    account_code: "1121".to_string(),
+                    debit: Decimal::ZERO,
+                    credit: Decimal::from(1000),
+                    line_desc: None,
+                },
+            ],
+        };
+
+        let err = repo
+            .save_voucher_with_idempotency(
+                &voucher,
+                Some((
+                    "locked-key",
+                    "accountant_lan",
+                    "/api/v1/vouchers",
+                    "hash-lock",
+                )),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AccountingError::PeriodClosed {
+                year: 2026,
+                month: 4
+            }
+        ));
+
+        // Ensure no idempotency record was created
+        let rec = repo
+            .get_idempotency_record("locked-key", "accountant_lan", "/api/v1/vouchers")
+            .unwrap();
+        assert!(rec.is_none());
+
+        // Ensure no voucher in DB
+        let vouchers = repo.list_vouchers(None, None).unwrap();
+        assert!(vouchers.is_empty());
     }
 }

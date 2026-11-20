@@ -1,21 +1,24 @@
 use axum::{
-    extract::{Path, Query, State},
-    http::StatusCode,
-    response::IntoResponse,
-    routing::{get, post},
     Json, Router,
+    extract::{Path, Query, Request, State},
+    http::StatusCode,
+    middleware::{Next, from_fn},
+    response::{IntoResponse, Response},
+    routing::{get, post},
 };
 use rust_decimal::Decimal;
 use serde_json::json;
 use std::sync::Arc;
 use uuid::Uuid;
 
+use crate::auth::{AuthenticatedUser, RequireController};
 use crate::closing::PeriodClosingEngine;
+use crate::database::SaveVoucherOutcome;
 use crate::dto::{
-    ApiError, AuditLogQuery, BackupRequest, BackupResponse, BalanceSheetQuery, BalanceSheetResponse,
-    ClosePeriodRequest, CreateVoucherRequest, DateRangeQuery, IncomeStatementQuery,
-    IncomeStatementResponse, PeriodStatusResponse, ReopenPeriodRequest, TrialBalanceResponse,
-    VoidVoucherRequest,
+    ApiError, AuditLogQuery, BackupRequest, BackupResponse, BalanceSheetQuery,
+    BalanceSheetResponse, ClosePeriodRequest, CreateVoucherRequest, DateRangeQuery, IdempotencyKey,
+    IncomeStatementQuery, IncomeStatementResponse, PeriodStatusResponse, ReopenPeriodRequest,
+    TrialBalanceResponse, VoidVoucherRequest, compute_request_hash,
 };
 use crate::ledger::AccountingError;
 use crate::models::{AccountingPeriod, AuditLogEntry, JournalVoucher, VoucherLine, VoucherStatus};
@@ -31,10 +34,39 @@ pub async fn health_check() -> impl IntoResponse {
 
 /// Creates a new journal voucher after validating all accounting invariants with LedgerEngine.
 /// Persists atomically to the database upon validation success and captures author attribution.
+/// Supports optional `Idempotency-Key` header for safe retries and duplicate prevention.
 pub async fn create_voucher(
+    user: AuthenticatedUser,
+    idempotency_key: IdempotencyKey,
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateVoucherRequest>,
 ) -> Result<(StatusCode, Json<JournalVoucher>), ApiError> {
+    // 1. If idempotency key provided, check for existing idempotency record
+    let idempotency_info = if let Some(ref key) = idempotency_key.0 {
+        let hash =
+            compute_request_hash(&req).map_err(|e| ApiError::InternalError(e.to_string()))?;
+        let actor = user.claims.sub.clone();
+        let endpoint = "/api/v1/vouchers".to_string();
+
+        if let Some(record) = state.repo.get_idempotency_record(key, &actor, &endpoint)? {
+            if record.request_hash == hash {
+                let cached_voucher: JournalVoucher = serde_json::from_str(&record.response_body)
+                    .map_err(|e| {
+                        ApiError::InternalError(format!("Corrupt idempotency record: {e}"))
+                    })?;
+                return Ok((StatusCode::CREATED, Json(cached_voucher)));
+            } else {
+                return Err(ApiError::Conflict(format!(
+                    "Idempotency key '{}' already used with a different request payload",
+                    key
+                )));
+            }
+        }
+        Some((key.clone(), actor, endpoint, hash))
+    } else {
+        None
+    };
+
     let voucher_id = Uuid::new_v4();
 
     let lines = req
@@ -58,7 +90,7 @@ pub async fn create_voucher(
         description: req.description,
         invoice_ref: req.invoice_ref,
         status: VoucherStatus::Posted,
-        created_by: req.created_by.unwrap_or_else(|| "system".to_string()),
+        created_by: user.claims.sub,
         approved_by: req.approved_by,
         voided_at: None,
         voided_by: None,
@@ -67,17 +99,28 @@ pub async fn create_voucher(
         lines,
     };
 
-    // 1. Invariant validation with LedgerEngine (THINK / CHECK)
+    // 2. Invariant validation with LedgerEngine (THINK / CHECK)
     state.engine.validate_voucher(&voucher)?;
 
-    // 2. Atomic persistence to SQLite (DO)
-    state.repo.save_voucher(&voucher)?;
+    // 3. Atomic persistence to SQLite with idempotency tracking (DO)
+    let idempotency_param = idempotency_info
+        .as_ref()
+        .map(|(k, a, e, h)| (k.as_str(), a.as_str(), e.as_str(), h.as_str()));
+    let outcome = state
+        .repo
+        .save_voucher_with_idempotency(&voucher, idempotency_param)?;
 
-    Ok((StatusCode::CREATED, Json(voucher)))
+    let result_voucher = match outcome {
+        SaveVoucherOutcome::Created(v) => v,
+        SaveVoucherOutcome::Replayed(v) => v,
+    };
+
+    Ok((StatusCode::CREATED, Json(result_voucher)))
 }
 
 /// Retrieves a specific voucher by its UUID.
 pub async fn get_voucher(
+    _user: AuthenticatedUser,
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<JournalVoucher>, ApiError> {
@@ -95,11 +138,12 @@ pub async fn get_voucher(
 ///
 /// Route: POST /api/v1/vouchers/{id}/void
 pub async fn void_voucher_handler(
+    RequireController(user): RequireController,
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
     Json(req): Json<VoidVoucherRequest>,
 ) -> Result<Json<JournalVoucher>, ApiError> {
-    let actor = req.actor.unwrap_or_else(|| "system".to_string());
+    let actor = user.claims.sub;
     let voucher = state.repo.void_voucher(id, &actor, &req.reason, None)?;
     Ok(Json(voucher))
 }
@@ -108,6 +152,7 @@ pub async fn void_voucher_handler(
 ///
 /// Route: GET /api/v1/audit-logs
 pub async fn list_audit_logs_handler(
+    _user: AuthenticatedUser,
     State(state): State<Arc<AppState>>,
     Query(query): Query<AuditLogQuery>,
 ) -> Result<Json<Vec<AuditLogEntry>>, ApiError> {
@@ -117,6 +162,7 @@ pub async fn list_audit_logs_handler(
 
 /// Lists vouchers with optional date range filtering.
 pub async fn list_vouchers(
+    _user: AuthenticatedUser,
     State(state): State<Arc<AppState>>,
     Query(query): Query<DateRangeQuery>,
 ) -> Result<Json<Vec<JournalVoucher>>, ApiError> {
@@ -126,6 +172,7 @@ pub async fn list_vouchers(
 
 /// Computes the statutory Trial Balance report (Bảng cân đối số phát sinh).
 pub async fn get_trial_balance(
+    _user: AuthenticatedUser,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<TrialBalanceResponse>, ApiError> {
     let accounts = state.repo.compute_trial_balance()?;
@@ -158,6 +205,7 @@ pub async fn get_trial_balance(
 ///
 /// Route: POST /api/v1/periods/close
 pub async fn close_period(
+    RequireController(user): RequireController,
     State(state): State<Arc<AppState>>,
     Json(req): Json<ClosePeriodRequest>,
 ) -> Result<Json<PeriodStatusResponse>, ApiError> {
@@ -178,8 +226,9 @@ pub async fn close_period(
     }
 
     // 2. Build closing voucher via 4-step closing engine
-    let closing_voucher =
+    let mut closing_voucher =
         PeriodClosingEngine::build_closing_voucher(&state.repo, req.year, req.month)?;
+    closing_voucher.created_by = user.claims.sub;
 
     // 3. Atomically persist closing voucher and mark period closed
     state
@@ -202,6 +251,7 @@ pub async fn close_period(
 ///
 /// Route: POST /api/v1/periods/reopen
 pub async fn reopen_period(
+    RequireController(user): RequireController,
     State(state): State<Arc<AppState>>,
     Json(req): Json<ReopenPeriodRequest>,
 ) -> Result<Json<PeriodStatusResponse>, ApiError> {
@@ -222,7 +272,9 @@ pub async fn reopen_period(
     }
 
     // 2. Atomically void closing voucher and unlock period
-    state.repo.reopen_period(req.year, req.month)?;
+    state
+        .repo
+        .reopen_period(req.year, req.month, &user.claims.sub)?;
 
     let period = AccountingPeriod {
         year: req.year,
@@ -238,6 +290,7 @@ pub async fn reopen_period(
 ///
 /// Route: GET /api/v1/periods
 pub async fn list_periods(
+    _user: AuthenticatedUser,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<PeriodStatusResponse>>, ApiError> {
     let periods = state.repo.list_periods()?;
@@ -250,6 +303,7 @@ pub async fn list_periods(
 ///
 /// Route: GET /api/v1/reports/balance-sheet?as_of_date=YYYY-MM-DD
 pub async fn get_balance_sheet(
+    _user: AuthenticatedUser,
     State(state): State<Arc<AppState>>,
     Query(query): Query<BalanceSheetQuery>,
 ) -> Result<Json<BalanceSheetResponse>, ApiError> {
@@ -266,6 +320,7 @@ pub async fn get_balance_sheet(
 ///
 /// Route: GET /api/v1/reports/income-statement?from_date=YYYY-MM-DD&to_date=YYYY-MM-DD
 pub async fn get_income_statement(
+    _user: AuthenticatedUser,
     State(state): State<Arc<AppState>>,
     Query(query): Query<IncomeStatementQuery>,
 ) -> Result<Json<IncomeStatementResponse>, ApiError> {
@@ -286,15 +341,17 @@ pub async fn get_income_statement(
 ///
 /// Route: POST /api/v1/system/backup
 pub async fn create_backup(
+    RequireController(user): RequireController,
     State(state): State<Arc<AppState>>,
     body: axum::body::Bytes,
 ) -> Result<(StatusCode, Json<BackupResponse>), ApiError> {
     let req: Option<BackupRequest> = if body.is_empty() {
         None
     } else {
-        Some(serde_json::from_slice(&body).map_err(|e| {
-            ApiError::BadRequest(format!("Invalid JSON payload: {}", e))
-        })?)
+        Some(
+            serde_json::from_slice(&body)
+                .map_err(|e| ApiError::BadRequest(format!("Invalid JSON payload: {}", e)))?,
+        )
     };
 
     let filename = req
@@ -317,7 +374,9 @@ pub async fn create_backup(
     let backup_path = std::path::Path::new(backup_dir).join(&filename);
     let backup_path_str = backup_path.to_string_lossy().to_string();
 
-    let file_size_bytes = state.repo.create_backup(&backup_path_str)?;
+    let file_size_bytes = state
+        .repo
+        .create_backup(&backup_path_str, &user.claims.sub)?;
 
     Ok((
         StatusCode::CREATED,
@@ -344,16 +403,54 @@ pub async fn swagger_ui_handler() -> axum::response::Html<&'static str> {
     axum::response::Html(crate::openapi::swagger_ui_html())
 }
 
+/// Axum middleware for structured HTTP request/response diagnostic logging for Root Cause Analysis (RCA).
+pub async fn request_logging_middleware(req: Request, next: Next) -> Response {
+    let start = std::time::Instant::now();
+    let method = req.method().clone();
+    let uri = req.uri().clone();
+    let path = uri.path().to_string();
+
+    let response = next.run(req).await;
+
+    let latency = start.elapsed();
+    let status = response.status();
+
+    if status.is_server_error() {
+        tracing::error!(
+            method = %method,
+            path = %path,
+            status = %status.as_u16(),
+            latency_ms = latency.as_millis(),
+            "HTTP request completed with 5xx server error"
+        );
+    } else if status.is_client_error() {
+        tracing::warn!(
+            method = %method,
+            path = %path,
+            status = %status.as_u16(),
+            latency_ms = latency.as_millis(),
+            "HTTP request completed with 4xx client error"
+        );
+    } else {
+        tracing::info!(
+            method = %method,
+            path = %path,
+            status = %status.as_u16(),
+            latency_ms = latency.as_millis(),
+            "HTTP request processed successfully"
+        );
+    }
+
+    response
+}
+
 /// Constructs the Axum application Router with all accounting routes mounted.
 pub fn create_app(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(|| async { "Accounting Engine Online" }))
         .route("/health", get(health_check))
         // Vouchers
-        .route(
-            "/api/v1/vouchers",
-            post(create_voucher).get(list_vouchers),
-        )
+        .route("/api/v1/vouchers", post(create_voucher).get(list_vouchers))
         .route("/api/v1/vouchers/{id}", get(get_voucher))
         .route("/api/v1/vouchers/{id}/void", post(void_voucher_handler))
         // Period Governance
@@ -365,11 +462,15 @@ pub fn create_app(state: Arc<AppState>) -> Router {
         // Statutory Reports
         .route("/api/v1/reports/trial-balance", get(get_trial_balance))
         .route("/api/v1/reports/balance-sheet", get(get_balance_sheet))
-        .route("/api/v1/reports/income-statement", get(get_income_statement))
+        .route(
+            "/api/v1/reports/income-statement",
+            get(get_income_statement),
+        )
         // Disaster Recovery & System Backup
         .route("/api/v1/system/backup", post(create_backup))
         // Interactive OpenAPI 3.1 & Swagger UI
         .route("/api-docs/openapi.json", get(openapi_json_handler))
         .route("/swagger-ui", get(swagger_ui_handler))
+        .layer(from_fn(request_logging_middleware))
         .with_state(state)
 }

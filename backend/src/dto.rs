@@ -1,7 +1,8 @@
 use axum::{
-    http::StatusCode,
-    response::{IntoResponse, Response},
     Json,
+    extract::FromRequestParts,
+    http::{StatusCode, request::Parts},
+    response::{IntoResponse, Response},
 };
 use chrono::NaiveDate;
 use rust_decimal::Decimal;
@@ -325,11 +326,24 @@ pub enum ApiError {
 
     #[error("Internal database error: {0}")]
     InternalError(String),
+
+    #[error("Conflict: {0}")]
+    Conflict(String),
+
+    #[error("Unauthorized: {0}")]
+    Unauthorized(String),
+
+    #[error("Forbidden: {0}")]
+    Forbidden(String),
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, code, message) = match self {
+            ApiError::Unauthorized(ref msg) => {
+                (StatusCode::UNAUTHORIZED, "UNAUTHORIZED", msg.as_str())
+            }
+            ApiError::Forbidden(ref msg) => (StatusCode::FORBIDDEN, "FORBIDDEN", msg.as_str()),
             ApiError::UnbalancedVoucher(ref msg) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "UNBALANCED_VOUCHER",
@@ -350,16 +364,9 @@ impl IntoResponse for ApiError {
                 "CANNOT_VOID_IN_CLOSED_PERIOD",
                 msg.as_str(),
             ),
-            ApiError::BadRequest(ref msg) => (
-                StatusCode::BAD_REQUEST,
-                "BAD_REQUEST",
-                msg.as_str(),
-            ),
-            ApiError::NotFound(ref msg) => (
-                StatusCode::NOT_FOUND,
-                "NOT_FOUND",
-                msg.as_str(),
-            ),
+            ApiError::BadRequest(ref msg) => (StatusCode::BAD_REQUEST, "BAD_REQUEST", msg.as_str()),
+            ApiError::NotFound(ref msg) => (StatusCode::NOT_FOUND, "NOT_FOUND", msg.as_str()),
+            ApiError::Conflict(ref msg) => (StatusCode::CONFLICT, "CONFLICT", msg.as_str()),
             ApiError::InternalError(ref msg) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "INTERNAL_ERROR",
@@ -371,6 +378,22 @@ impl IntoResponse for ApiError {
             "error": code,
             "message": message,
         }));
+
+        if status.is_server_error() {
+            tracing::error!(
+                status = %status.as_u16(),
+                error_code = code,
+                error_message = %message,
+                "API internal server error occurred"
+            );
+        } else {
+            tracing::warn!(
+                status = %status.as_u16(),
+                error_code = code,
+                error_message = %message,
+                "API request rejected with client error"
+            );
+        }
 
         (status, body).into_response()
     }
@@ -392,7 +415,8 @@ impl From<AccountingError> for ApiError {
                 account_code
             )),
             AccountingError::EmptyOrSingleLineVoucher => ApiError::BadRequest(
-                "Voucher must have at least 2 lines (at least one debit and one credit)".to_string(),
+                "Voucher must have at least 2 lines (at least one debit and one credit)"
+                    .to_string(),
             ),
             AccountingError::InvalidLine {
                 account_code,
@@ -420,10 +444,9 @@ impl From<AccountingError> for ApiError {
                 "Invalid accounting period: year={}, month={}. Month must be between 1 and 12",
                 year, month
             )),
-            AccountingError::VoucherAlreadyVoided { voucher_no } => ApiError::VoucherAlreadyVoided(format!(
-                "Voucher {} is already voided",
-                voucher_no
-            )),
+            AccountingError::VoucherAlreadyVoided { voucher_no } => {
+                ApiError::VoucherAlreadyVoided(format!("Voucher {} is already voided", voucher_no))
+            }
             AccountingError::CannotVoidInClosedPeriod {
                 voucher_no,
                 year,
@@ -432,9 +455,12 @@ impl From<AccountingError> for ApiError {
                 "Cannot void voucher {} in closed period {:04}-{:02}",
                 voucher_no, year, month
             )),
-            AccountingError::VoucherNotFound(id) => ApiError::NotFound(format!(
-                "Voucher with id '{}' not found",
-                id
+            AccountingError::VoucherNotFound(id) => {
+                ApiError::NotFound(format!("Voucher with id '{}' not found", id))
+            }
+            AccountingError::IdempotencyConflict { key } => ApiError::Conflict(format!(
+                "Idempotency conflict for key '{}': request payload does not match original request",
+                key
             )),
             AccountingError::DatabaseError(msg) => {
                 if msg.contains("UNIQUE constraint failed: vouchers.voucher_no") {
@@ -460,4 +486,63 @@ impl From<rusqlite::Error> for ApiError {
             _ => ApiError::InternalError(err.to_string()),
         }
     }
+}
+
+/// Validates an `Idempotency-Key` header value:
+/// - Must not be empty or whitespace-only (1..=255 characters after trimming)
+/// - Must contain only printable ASCII characters (32..=126)
+pub fn validate_idempotency_key(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("Idempotency-Key header cannot be empty or whitespace-only".to_string());
+    }
+    if trimmed.len() > 255 {
+        return Err("Idempotency-Key header length exceeds 255 characters".to_string());
+    }
+    if !trimmed.chars().all(|c| c.is_ascii_graphic() || c == ' ') {
+        return Err(
+            "Idempotency-Key header must contain only printable ASCII characters".to_string(),
+        );
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Extractor for the optional `Idempotency-Key` HTTP header.
+/// Enforces length 1..=255 and printable ASCII characters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdempotencyKey(pub Option<String>);
+
+impl<S> FromRequestParts<S> for IdempotencyKey
+where
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        match parts.headers.get("idempotency-key") {
+            None => Ok(IdempotencyKey(None)),
+            Some(val) => {
+                let s = val.to_str().map_err(|_| {
+                    ApiError::BadRequest(
+                        "Idempotency-Key header contains non-ASCII characters".to_string(),
+                    )
+                })?;
+                validate_idempotency_key(s)
+                    .map(|k| IdempotencyKey(Some(k)))
+                    .map_err(ApiError::BadRequest)
+            }
+        }
+    }
+}
+
+/// Computes a canonical SHA-256 request payload hash as a 64-character lowercase hex string.
+pub fn compute_request_hash(req: &CreateVoucherRequest) -> Result<String, serde_json::Error> {
+    let bytes = serde_json::to_vec(req)?;
+    let digest = ring::digest::digest(&ring::digest::SHA256, &bytes);
+    let mut hash_hex = String::with_capacity(64);
+    for byte in digest.as_ref() {
+        use std::fmt::Write;
+        let _ = write!(hash_hex, "{:02x}", byte);
+    }
+    Ok(hash_hex)
 }

@@ -38,7 +38,7 @@ Strict layered clean architecture (`backend/src/`):
 * `closing.rs` (Application Workflow): Statutory 4-step closing engine. Relies on domain types and account balance maps; no direct database connection handles.
 * `database.rs` (Persistence Layer): SQLite connection mutex (`Arc<Mutex<Connection>>`), parameterized DDL/DML, transaction management, and audit logging.
 * `dto.rs` & `handlers.rs` (Interface Layer): Axum 0.8 routing, payload validation, status mapping, and OpenAPI specification. Imports domain, application, and persistence types.
-* `config.rs`: 12-factor environment configuration loader (`HOST`, `PORT`, `DATABASE_PATH`, `BACKUP_DIR`, `LOG_LEVEL`).
+* `config.rs`: 12-factor environment configuration loader (`HOST`, `PORT`, `DATABASE_PATH`, `BACKUP_DIR`, `LOG_LEVEL`, `LOG_DIR`, `LOG_FORMAT`, `JWT_SECRET`).
 
 ## 4. Financial Safety Rules (Non-Negotiable)
 1. **Zero-Float Guarantee**: Use `rust_decimal::Decimal` for all amounts and account balances. Never use `f32` or `f64`. Store in SQLite columns as `TEXT`.

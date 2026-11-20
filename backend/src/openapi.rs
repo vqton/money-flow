@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Generates a complete OpenAPI 3.1.0 specification for the VAS Accounting Engine.
 /// Documents all statutory endpoints, request/response models, and error structures
@@ -71,6 +71,23 @@ pub fn generate_openapi_spec() -> Value {
                     "tags": ["Vouchers"],
                     "summary": "Post Double-Entry Journal Voucher",
                     "description": "Validates statutory invariants (sum of debits == sum of credits, period open, valid accounts) and saves the voucher.",
+                    "security": [
+                        { "bearerAuth": [] }
+                    ],
+                    "parameters": [
+                        {
+                            "name": "Idempotency-Key",
+                            "in": "header",
+                            "required": false,
+                            "description": "Optional unique idempotency key (1..=255 printable ASCII chars) to safely retry voucher creation without duplicate ledger posting.",
+                            "schema": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 255,
+                                "example": "7c9e6679-7425-40de-944b-e07fc1f90ae7"
+                            }
+                        }
+                    ],
                     "requestBody": {
                         "required": true,
                         "content": {
@@ -89,7 +106,23 @@ pub fn generate_openapi_spec() -> Value {
                             }
                         },
                         "400": {
-                            "description": "Malformed request, duplicate voucher number, or validation error",
+                            "description": "Malformed request, invalid or overlong Idempotency-Key header, duplicate voucher number, or validation error",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
+                        "401": {
+                            "description": "Unauthorized - Missing, malformed, or expired Bearer JWT token",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
+                        "409": {
+                            "description": "Idempotency conflict: Idempotency-Key already used with a different request payload",
                             "content": {
                                 "application/json": {
                                     "schema": { "$ref": "#/components/schemas/ErrorResponse" }
@@ -118,6 +151,9 @@ pub fn generate_openapi_spec() -> Value {
                     "tags": ["Vouchers"],
                     "summary": "List Journal Vouchers",
                     "description": "Retrieves vouchers optionally filtered by an inclusive date range.",
+                    "security": [
+                        { "bearerAuth": [] }
+                    ],
                     "parameters": [
                         {
                             "name": "from_date",
@@ -146,6 +182,14 @@ pub fn generate_openapi_spec() -> Value {
                                 }
                             }
                         },
+                        "401": {
+                            "description": "Unauthorized - Missing, malformed, or expired Bearer JWT token",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
                         "500": {
                             "description": "Internal database error",
                             "content": {
@@ -162,6 +206,9 @@ pub fn generate_openapi_spec() -> Value {
                     "tags": ["Vouchers"],
                     "summary": "Get Voucher by ID",
                     "description": "Retrieves details of a single journal voucher by its UUID.",
+                    "security": [
+                        { "bearerAuth": [] }
+                    ],
                     "parameters": [
                         {
                             "name": "id",
@@ -177,6 +224,14 @@ pub fn generate_openapi_spec() -> Value {
                             "content": {
                                 "application/json": {
                                     "schema": { "$ref": "#/components/schemas/VoucherResponse" }
+                                }
+                            }
+                        },
+                        "401": {
+                            "description": "Unauthorized - Missing, malformed, or expired Bearer JWT token",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
                                 }
                             }
                         },
@@ -204,6 +259,9 @@ pub fn generate_openapi_spec() -> Value {
                     "tags": ["Vouchers", "Audit"],
                     "summary": "Void Journal Voucher",
                     "description": "Non-destructively cancels an active journal voucher. The voucher is marked VOIDED, isolated from reports, and permanently retained with audit logs.",
+                    "security": [
+                        { "bearerAuth": [] }
+                    ],
                     "parameters": [
                         {
                             "name": "id",
@@ -238,6 +296,22 @@ pub fn generate_openapi_spec() -> Value {
                                 }
                             }
                         },
+                        "401": {
+                            "description": "Unauthorized - Missing, malformed, or expired Bearer JWT token",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
+                        "403": {
+                            "description": "Forbidden - Controller role required",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
                         "404": {
                             "description": "Voucher not found",
                             "content": {
@@ -253,6 +327,14 @@ pub fn generate_openapi_spec() -> Value {
                                     "schema": { "$ref": "#/components/schemas/ErrorResponse" }
                                 }
                             }
+                        },
+                        "500": {
+                            "description": "Internal database error",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
                         }
                     }
                 }
@@ -262,6 +344,9 @@ pub fn generate_openapi_spec() -> Value {
                     "tags": ["Period Governance"],
                     "summary": "List Accounting Periods",
                     "description": "Retrieves the statutory lock status of recorded accounting periods.",
+                    "security": [
+                        { "bearerAuth": [] }
+                    ],
                     "responses": {
                         "200": {
                             "description": "List of accounting periods",
@@ -271,6 +356,14 @@ pub fn generate_openapi_spec() -> Value {
                                         "type": "array",
                                         "items": { "$ref": "#/components/schemas/PeriodStatusResponse" }
                                     }
+                                }
+                            }
+                        },
+                        "401": {
+                            "description": "Unauthorized - Missing, malformed, or expired Bearer JWT token",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
                                 }
                             }
                         },
@@ -290,6 +383,9 @@ pub fn generate_openapi_spec() -> Value {
                     "tags": ["Period Governance"],
                     "summary": "Close Accounting Period",
                     "description": "Performs month-end closing: calculates P&L, generates the closing voucher (transferring revenues/expenses to TK 911 and TK 4212), and locks the period.",
+                    "security": [
+                        { "bearerAuth": [] }
+                    ],
                     "requestBody": {
                         "required": true,
                         "content": {
@@ -315,6 +411,22 @@ pub fn generate_openapi_spec() -> Value {
                                 }
                             }
                         },
+                        "401": {
+                            "description": "Unauthorized - Missing, malformed, or expired Bearer JWT token",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
+                        "403": {
+                            "description": "Forbidden - Controller role required",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
                         "500": {
                             "description": "Internal database error",
                             "content": {
@@ -331,6 +443,9 @@ pub fn generate_openapi_spec() -> Value {
                     "tags": ["Period Governance"],
                     "summary": "Reopen Accounting Period",
                     "description": "Reopens a previously closed period for statutory corrections and voids the closing voucher.",
+                    "security": [
+                        { "bearerAuth": [] }
+                    ],
                     "requestBody": {
                         "required": true,
                         "content": {
@@ -356,6 +471,22 @@ pub fn generate_openapi_spec() -> Value {
                                 }
                             }
                         },
+                        "401": {
+                            "description": "Unauthorized - Missing, malformed, or expired Bearer JWT token",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
+                        "403": {
+                            "description": "Forbidden - Controller role required",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
                         "500": {
                             "description": "Internal database error",
                             "content": {
@@ -372,6 +503,9 @@ pub fn generate_openapi_spec() -> Value {
                     "tags": ["Audit"],
                     "summary": "Query Audit Trail",
                     "description": "Retrieves immutable forensic audit trail records with multi-dimensional filtering by actor, action, resource, and date range.",
+                    "security": [
+                        { "bearerAuth": [] }
+                    ],
                     "parameters": [
                         { "name": "actor", "in": "query", "required": false, "schema": { "type": "string" }, "description": "Filter by actor identity" },
                         { "name": "action", "in": "query", "required": false, "schema": { "type": "string" }, "description": "Filter by action type (CREATE_VOUCHER, VOID_VOUCHER, PERIOD_CLOSE, PERIOD_REOPEN, SYSTEM_BACKUP)" },
@@ -393,6 +527,14 @@ pub fn generate_openapi_spec() -> Value {
                                 }
                             }
                         },
+                        "401": {
+                            "description": "Unauthorized - Missing, malformed, or expired Bearer JWT token",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
                         "500": {
                             "description": "Internal database error",
                             "content": {
@@ -409,12 +551,23 @@ pub fn generate_openapi_spec() -> Value {
                     "tags": ["Statutory Reports"],
                     "summary": "Statutory Trial Balance Report (Bảng cân đối số phát sinh)",
                     "description": "Aggregates all ledger postings across all accounts and verifies equilibrium (total debit == total credit).",
+                    "security": [
+                        { "bearerAuth": [] }
+                    ],
                     "responses": {
                         "200": {
                             "description": "Trial balance report",
                             "content": {
                                 "application/json": {
                                     "schema": { "$ref": "#/components/schemas/TrialBalanceResponse" }
+                                }
+                            }
+                        },
+                        "401": {
+                            "description": "Unauthorized - Missing, malformed, or expired Bearer JWT token",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
                                 }
                             }
                         },
@@ -434,6 +587,9 @@ pub fn generate_openapi_spec() -> Value {
                     "tags": ["Statutory Reports"],
                     "summary": "Statutory Balance Sheet Report (Bảng cân đối kế toán)",
                     "description": "Computes Balance Sheet as of cut-off date. Accurately deducts contra-asset accounts (TK 214 accumulated depreciation, TK 229 provisions) from total assets.",
+                    "security": [
+                        { "bearerAuth": [] }
+                    ],
                     "parameters": [
                         {
                             "name": "as_of_date",
@@ -449,6 +605,14 @@ pub fn generate_openapi_spec() -> Value {
                             "content": {
                                 "application/json": {
                                     "schema": { "$ref": "#/components/schemas/BalanceSheetResponse" }
+                                }
+                            }
+                        },
+                        "401": {
+                            "description": "Unauthorized - Missing, malformed, or expired Bearer JWT token",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
                                 }
                             }
                         },
@@ -468,6 +632,9 @@ pub fn generate_openapi_spec() -> Value {
                     "tags": ["Statutory Reports"],
                     "summary": "Statutory Income Statement Report (Báo cáo kết quả hoạt động kinh doanh)",
                     "description": "Computes statutory profit & loss metrics across the specified reporting window.",
+                    "security": [
+                        { "bearerAuth": [] }
+                    ],
                     "parameters": [
                         {
                             "name": "from_date",
@@ -501,6 +668,14 @@ pub fn generate_openapi_spec() -> Value {
                                 }
                             }
                         },
+                        "401": {
+                            "description": "Unauthorized - Missing, malformed, or expired Bearer JWT token",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
                         "500": {
                             "description": "Internal database error",
                             "content": {
@@ -517,6 +692,9 @@ pub fn generate_openapi_spec() -> Value {
                     "tags": ["System"],
                     "summary": "Create Atomic Database Backup Snapshot",
                     "description": "Initiates an atomic zero-downtime point-in-time SQLite snapshot via VACUUM INTO under the configured backup directory.",
+                    "security": [
+                        { "bearerAuth": [] }
+                    ],
                     "requestBody": {
                         "required": false,
                         "content": {
@@ -536,6 +714,22 @@ pub fn generate_openapi_spec() -> Value {
                         },
                         "400": {
                             "description": "Invalid filename (directory traversal forbidden)",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
+                        "401": {
+                            "description": "Unauthorized - Missing, malformed, or expired Bearer JWT token",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
+                        "403": {
+                            "description": "Forbidden - Controller role required",
                             "content": {
                                 "application/json": {
                                     "schema": { "$ref": "#/components/schemas/ErrorResponse" }
@@ -589,6 +783,14 @@ pub fn generate_openapi_spec() -> Value {
             }
         },
         "components": {
+            "securitySchemes": {
+                "bearerAuth": {
+                    "type": "http",
+                    "scheme": "bearer",
+                    "bearerFormat": "JWT",
+                    "description": "JWT Bearer token containing user identity and role (Accountant or Controller)"
+                }
+            },
             "schemas": {
                 "CreateVoucherRequest": {
                     "type": "object",
@@ -816,9 +1018,13 @@ pub fn generate_openapi_spec() -> Value {
                             "enum": [
                                 "UNBALANCED_VOUCHER",
                                 "PERIOD_CLOSED",
+                                "VOUCHER_ALREADY_VOIDED",
+                                "CANNOT_VOID_IN_CLOSED_PERIOD",
                                 "BAD_REQUEST",
                                 "NOT_FOUND",
-                                "INTERNAL_ERROR"
+                                "INTERNAL_ERROR",
+                                "UNAUTHORIZED",
+                                "FORBIDDEN"
                             ],
                             "example": "PERIOD_CLOSED"
                         },
@@ -885,6 +1091,41 @@ mod tests {
         assert!(paths.contains_key("/api/v1/vouchers"));
         assert!(paths.contains_key("/api-docs/openapi.json"));
         assert!(paths.contains_key("/swagger-ui"));
+
+        // Verify security schemes
+        let sec_schemes = spec["components"]["securitySchemes"].as_object().unwrap();
+        assert!(sec_schemes.contains_key("bearerAuth"));
+        assert_eq!(sec_schemes["bearerAuth"]["type"], "http");
+        assert_eq!(sec_schemes["bearerAuth"]["scheme"], "bearer");
+        assert_eq!(sec_schemes["bearerAuth"]["bearerFormat"], "JWT");
+
+        // Verify protected endpoints declare security and 401
+        let voucher_post = &paths["/api/v1/vouchers"]["post"];
+        assert!(voucher_post["security"].as_array().is_some());
+        assert!(voucher_post["responses"]["401"].as_object().is_some());
+
+        // Verify Idempotency-Key header parameter and 409 response on voucher POST
+        let params = voucher_post["parameters"]
+            .as_array()
+            .expect("Voucher POST must declare parameters");
+        assert!(
+            params
+                .iter()
+                .any(|p| p["name"] == "Idempotency-Key" && p["in"] == "header")
+        );
+        assert!(voucher_post["responses"]["409"].as_object().is_some());
+
+        // Verify privileged endpoints declare 403
+        let void_post = &paths["/api/v1/vouchers/{id}/void"]["post"];
+        assert!(void_post["security"].as_array().is_some());
+        assert!(void_post["responses"]["401"].as_object().is_some());
+        assert!(void_post["responses"]["403"].as_object().is_some());
+
+        // Verify unauthenticated endpoints do not declare security
+        assert!(paths["/"]["get"]["security"].is_null());
+        assert!(paths["/health"]["get"]["security"].is_null());
+        assert!(paths["/api-docs/openapi.json"]["get"]["security"].is_null());
+        assert!(paths["/swagger-ui"]["get"]["security"].is_null());
 
         let schemas = spec["components"]["schemas"].as_object().unwrap();
         assert!(schemas.contains_key("BackupRequest"));

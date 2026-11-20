@@ -139,9 +139,8 @@ impl PeriodClosingEngine {
         let mut revenue_lines = Vec::new();
 
         for (code, (debit, credit)) in balances {
-            let is_rev_acct = code.starts_with("511")
-                || code.starts_with("515")
-                || code.starts_with("711");
+            let is_rev_acct =
+                code.starts_with("511") || code.starts_with("515") || code.starts_with("711");
 
             if is_rev_acct {
                 let gross_rev = credit - debit;
@@ -334,7 +333,10 @@ mod tests {
             .expect("Closing voucher creation should succeed");
 
         assert_eq!(voucher.voucher_no, "KC-2026-01");
-        assert_eq!(voucher.voucher_date, NaiveDate::from_ymd_opt(2026, 1, 31).unwrap());
+        assert_eq!(
+            voucher.voucher_date,
+            NaiveDate::from_ymd_opt(2026, 1, 31).unwrap()
+        );
 
         // Validate complete balance in 911
         let mut debit_911 = Decimal::ZERO;
@@ -351,8 +353,15 @@ mod tests {
             }
         }
 
-        assert_eq!(debit_911, credit_911, "Account 911 must be perfectly balanced");
-        assert_eq!(credit_4212, dec!(35000000), "Net profit of 35M must be credited to 4212");
+        assert_eq!(
+            debit_911, credit_911,
+            "Account 911 must be perfectly balanced"
+        );
+        assert_eq!(
+            credit_4212,
+            dec!(35000000),
+            "Net profit of 35M must be credited to 4212"
+        );
     }
 
     #[test]
@@ -381,8 +390,15 @@ mod tests {
             }
         }
 
-        assert_eq!(debit_911, credit_911, "Account 911 must balance with loss transfer");
-        assert_eq!(debit_4212, dec!(25000000), "Net loss of 25M must be debited to 4212");
+        assert_eq!(
+            debit_911, credit_911,
+            "Account 911 must balance with loss transfer"
+        );
+        assert_eq!(
+            debit_4212,
+            dec!(25000000),
+            "Net loss of 25M must be debited to 4212"
+        );
     }
 
     #[test]
@@ -401,7 +417,10 @@ mod tests {
             .expect("Closing voucher creation should succeed");
 
         assert_eq!(voucher.voucher_no, "KC-2026-01");
-        assert_eq!(voucher.voucher_date, NaiveDate::from_ymd_opt(2026, 1, 31).unwrap());
+        assert_eq!(
+            voucher.voucher_date,
+            NaiveDate::from_ymd_opt(2026, 1, 31).unwrap()
+        );
 
         let mut total_debit_5111 = Decimal::ZERO;
         let mut total_debit_5112 = Decimal::ZERO;
@@ -438,10 +457,26 @@ mod tests {
             vec![dec!(5000000), dec!(195000000)],
             "5112 must have 5M offset in Step 1 and 195M transfer to 911 in Step 2"
         );
-        assert_eq!(total_debit_5111, dec!(10000000), "5111 must be debited by 10M to fully offset");
-        assert_eq!(total_debit_5112, dec!(200000000), "5112 debited by 200M (5M offset + 195M to 911)");
-        assert_eq!(credit_4212, dec!(115000000), "Net profit credited to 4212 must be 115,000,000");
+        assert_eq!(
+            total_debit_5111,
+            dec!(10000000),
+            "5111 must be debited by 10M to fully offset"
+        );
+        assert_eq!(
+            total_debit_5112,
+            dec!(200000000),
+            "5112 debited by 200M (5M offset + 195M to 911)"
+        );
+        assert_eq!(
+            credit_4212,
+            dec!(115000000),
+            "Net profit credited to 4212 must be 115,000,000"
+        );
         assert_eq!(debit_911, credit_911, "Account 911 must balance to 0.00");
-        assert_eq!(debit_911, dec!(195000000), "Account 911 total throughput must be 195,000,000");
+        assert_eq!(
+            debit_911,
+            dec!(195000000),
+            "Account 911 total throughput must be 195,000,000"
+        );
     }
 }

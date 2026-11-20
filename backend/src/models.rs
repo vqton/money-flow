@@ -182,7 +182,8 @@ impl BalanceSheetReport {
         liabilities: Decimal,
         equity: Decimal,
     ) -> Self {
-        let total_assets = current_assets + non_current_assets - (accumulated_depreciation + asset_provisions);
+        let total_assets =
+            current_assets + non_current_assets - (accumulated_depreciation + asset_provisions);
         let total_resources = liabilities + equity;
         let is_balanced = total_assets == total_resources;
 
@@ -258,7 +259,10 @@ impl IncomeStatementReport {
     ) -> Self {
         let net_revenue = gross_revenue - revenue_deductions;
         let gross_profit = net_revenue - cost_of_goods_sold;
-        let operating_profit = gross_profit + financial_income - financial_expenses - selling_expenses - administrative_expenses;
+        let operating_profit = gross_profit + financial_income
+            - financial_expenses
+            - selling_expenses
+            - administrative_expenses;
         let net_profit_before_tax = operating_profit + (other_income - other_expenses);
         let net_profit_after_tax = net_profit_before_tax - corporate_tax;
 
@@ -282,4 +286,17 @@ impl IncomeStatementReport {
             net_profit_after_tax,
         }
     }
+}
+
+/// Immutable idempotency tracking entry for API deduplication and replay.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IdempotencyRecord {
+    pub key: String,
+    pub actor: String,
+    pub endpoint: String,
+    pub request_hash: String,
+    pub status_code: u16,
+    pub response_body: String,
+    pub resource_id: Option<String>,
+    pub created_at: String,
 }
