@@ -1,0 +1,10 @@
+[package]
+name = "money-flow"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rust_decimal = "1"
+serde = { version = "1", features = ["derive"] }
+uuid = { version = "1", features = ["v4"] }
+

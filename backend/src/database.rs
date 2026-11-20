@@ -1,0 +1,1722 @@
+use crate::dto::TrialBalanceRow;
+use crate::ledger::AccountingError;
+use crate::models::{
+    AccountingPeriod, AuditLogEntry, BalanceSheetReport, IncomeStatementReport, JournalVoucher,
+    VoucherLine, VoucherStatus,
+};
+use chrono::{Datelike, NaiveDate};
+use rusqlite::{params, Connection, OptionalExtension};
+use rust_decimal::Decimal;
+use std::collections::BTreeMap;
+use std::str::FromStr;
+use std::sync::{Arc, Mutex};
+use uuid::Uuid;
+
+/// Thread-safe SQLite repository managing audit-grade persistence of vouchers and ledger lines.
+#[derive(Clone)]
+pub struct LedgerRepository {
+    conn: Arc<Mutex<Connection>>,
+}
+
+impl LedgerRepository {
+    pub fn new(conn: Connection) -> Self {
+        Self {
+            conn: Arc::new(Mutex::new(conn)),
+        }
+    }
+
+    /// Initializes the relational double-entry schema in SQLite.
+    /// Foreign key constraints, period tracking, and performance indexes are enforced.
+    pub fn init_schema(&self) -> Result<(), AccountingError> {
+        let conn = self.conn.lock().unwrap();
+
+        // Configure SQLite pragmas for high concurrency, durability, and foreign key integrity.
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA busy_timeout = 5000;
+             PRAGMA synchronous = NORMAL;
+             PRAGMA foreign_keys = ON;",
+        )?;
+
+        // 1. Voucher Header Table (Chứng từ kế toán) with User Attribution and Lifecycle Audit Columns
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS vouchers (
+                id TEXT PRIMARY KEY,
+                voucher_no TEXT NOT NULL,
+                voucher_date TEXT NOT NULL,
+                description TEXT NOT NULL,
+                invoice_ref TEXT,
+                status TEXT NOT NULL DEFAULT 'POSTED',
+                created_by TEXT NOT NULL DEFAULT 'system',
+                approved_by TEXT,
+                voided_at TEXT,
+                voided_by TEXT,
+                void_reason TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );",
+            [],
+        )?;
+
+        // 2. Voucher Lines Table (Các định khoản Nợ / Có) with Explicit Leg Sequence Order
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS voucher_lines (
+                id TEXT PRIMARY KEY,
+                voucher_id TEXT NOT NULL REFERENCES vouchers(id) ON DELETE CASCADE,
+                line_no INTEGER NOT NULL DEFAULT 1,
+                account_code TEXT NOT NULL,
+                debit TEXT NOT NULL,
+                credit TEXT NOT NULL,
+                line_desc TEXT
+            );",
+            [],
+        )?;
+
+        // 3. Accounting Periods Table (Period Lock & Statutory Status)
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS accounting_periods (
+                year INTEGER NOT NULL,
+                month INTEGER NOT NULL,
+                is_closed INTEGER NOT NULL DEFAULT 0,
+                closed_at TEXT,
+                PRIMARY KEY (year, month)
+            );",
+            [],
+        )?;
+
+        // 4. Immutable Audit Logs Table (Sổ nhật ký kiểm toán hệ thống)
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS audit_logs (
+                id TEXT PRIMARY KEY,
+                timestamp TEXT NOT NULL DEFAULT (datetime('now')),
+                actor TEXT NOT NULL,
+                action TEXT NOT NULL,
+                resource_type TEXT NOT NULL,
+                resource_id TEXT,
+                details TEXT,
+                client_ip TEXT
+            );",
+            [],
+        )?;
+
+        // 5. Performance & Audit Indices
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_vouchers_no_posted ON vouchers(voucher_no) WHERE status = 'POSTED';",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_vouchers_date ON vouchers(voucher_date);",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_vouchers_status ON vouchers(status);",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_lines_account ON voucher_lines(account_code);",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_lines_voucher ON voucher_lines(voucher_id);",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_periods_closed ON accounting_periods(is_closed);",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_logs(actor);",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_logs(action);",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_logs(timestamp);",
+            [],
+        )?;
+
+        Ok(())
+    }
+
+    /// Internal helper to record an immutable audit log entry within an active transaction.
+    fn record_audit_log_tx(
+        tx: &rusqlite::Transaction,
+        entry: &AuditLogEntry,
+    ) -> Result<(), rusqlite::Error> {
+        tx.execute(
+            "INSERT INTO audit_logs (id, timestamp, actor, action, resource_type, resource_id, details, client_ip)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                entry.id.to_string(),
+                entry.timestamp,
+                entry.actor,
+                entry.action,
+                entry.resource_type,
+                entry.resource_id,
+                entry.details,
+                entry.client_ip,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Internal helper to insert voucher header and lines within an active transaction.
+    fn insert_voucher_tx(
+        tx: &rusqlite::Transaction,
+        voucher: &JournalVoucher,
+    ) -> Result<(), rusqlite::Error> {
+        tx.execute(
+            "INSERT INTO vouchers (id, voucher_no, voucher_date, description, invoice_ref,
+                                   status, created_by, approved_by, voided_at, voided_by, void_reason, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                voucher.id.to_string(),
+                voucher.voucher_no,
+                voucher.voucher_date.to_string(),
+                voucher.description,
+                voucher.invoice_ref,
+                voucher.status.to_string(),
+                voucher.created_by,
+                voucher.approved_by,
+                voucher.voided_at,
+                voucher.voided_by,
+                voucher.void_reason,
+                voucher.created_at,
+            ],
+        )?;
+
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO voucher_lines (id, voucher_id, line_no, account_code, debit, credit, line_desc)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?;
+
+            for line in &voucher.lines {
+                stmt.execute(params![
+                    line.id.to_string(),
+                    voucher.id.to_string(),
+                    line.line_no,
+                    line.account_code,
+                    line.debit.to_string(),
+                    line.credit.to_string(),
+                    line.line_desc,
+                ])?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Persists a complete JournalVoucher (header + all debit/credit lines)
+    /// within a single ACID transaction. Rejects posting if the period is closed.
+    /// Also records an immutable CREATE_VOUCHER audit trail event.
+    pub fn save_voucher(&self, voucher: &JournalVoucher) -> Result<(), AccountingError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        let year = voucher.voucher_date.year();
+        let month = voucher.voucher_date.month();
+
+        // Enforce period lock
+        let is_closed: bool = tx
+            .query_row(
+                "SELECT is_closed FROM accounting_periods WHERE year = ?1 AND month = ?2",
+                params![year, month],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(false);
+
+        if is_closed {
+            return Err(AccountingError::PeriodClosed { year, month });
+        }
+
+        Self::insert_voucher_tx(&tx, voucher)?;
+
+        let audit = AuditLogEntry {
+            id: Uuid::new_v4(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            actor: voucher.created_by.clone(),
+            action: "CREATE_VOUCHER".to_string(),
+            resource_type: "VOUCHER".to_string(),
+            resource_id: Some(voucher.voucher_no.clone()),
+            details: Some(format!(
+                "Created voucher {} with {} lines",
+                voucher.voucher_no,
+                voucher.lines.len()
+            )),
+            client_ip: None,
+        };
+        Self::record_audit_log_tx(&tx, &audit)?;
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Checks whether an accounting period (year, month) is closed.
+    pub fn is_period_closed(&self, year: i32, month: u32) -> Result<bool, AccountingError> {
+        let conn = self.conn.lock().unwrap();
+        let is_closed: bool = conn
+            .query_row(
+                "SELECT is_closed FROM accounting_periods WHERE year = ?1 AND month = ?2",
+                params![year, month],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(false);
+
+        Ok(is_closed)
+    }
+
+    /// Atomically persists the closing voucher, marks the accounting period as closed,
+    /// and records an immutable PERIOD_CLOSE audit trail event.
+    pub fn close_period(
+        &self,
+        year: i32,
+        month: u32,
+        closing_voucher: &JournalVoucher,
+    ) -> Result<(), AccountingError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        // Verify period is not already closed
+        let is_closed: bool = tx
+            .query_row(
+                "SELECT is_closed FROM accounting_periods WHERE year = ?1 AND month = ?2",
+                params![year, month],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(false);
+
+        if is_closed {
+            return Err(AccountingError::PeriodAlreadyClosed { year, month });
+        }
+
+        // Persist closing voucher
+        Self::insert_voucher_tx(&tx, closing_voucher)?;
+
+        // Record closed period
+        let closed_at = chrono::Utc::now().to_rfc3339();
+        tx.execute(
+            "INSERT INTO accounting_periods (year, month, is_closed, closed_at)
+             VALUES (?1, ?2, 1, ?3)
+             ON CONFLICT(year, month) DO UPDATE SET
+                 is_closed = 1,
+                 closed_at = excluded.closed_at",
+            params![year, month, closed_at],
+        )?;
+
+        let audit = AuditLogEntry {
+            id: Uuid::new_v4(),
+            timestamp: closed_at,
+            actor: closing_voucher.created_by.clone(),
+            action: "PERIOD_CLOSE".to_string(),
+            resource_type: "PERIOD".to_string(),
+            resource_id: Some(format!("{year}-{month:02}")),
+            details: Some(format!(
+                "Closed period {year}-{month:02} with voucher {}",
+                closing_voucher.voucher_no
+            )),
+            client_ip: None,
+        };
+        Self::record_audit_log_tx(&tx, &audit)?;
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Atomically reopens a closed accounting period via statutory non-destructive voiding:
+    /// marks the closing voucher as VOIDED (preserving historical audit trails),
+    /// resets `is_closed` to false, and records a PERIOD_REOPEN audit event.
+    pub fn reopen_period(&self, year: i32, month: u32) -> Result<(), AccountingError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        let is_closed: bool = tx
+            .query_row(
+                "SELECT is_closed FROM accounting_periods WHERE year = ?1 AND month = ?2",
+                params![year, month],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(false);
+
+        if !is_closed {
+            return Err(AccountingError::PeriodNotClosed { year, month });
+        }
+
+        let closing_voucher_no = format!("KC-{year}-{month:02}");
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // Non-destructive voiding of the closing voucher
+        tx.execute(
+            "UPDATE vouchers
+             SET status = 'VOIDED',
+                 voided_at = ?1,
+                 voided_by = 'system',
+                 void_reason = 'Period reopened'
+             WHERE voucher_no = ?2 AND status = 'POSTED'",
+            params![now, closing_voucher_no],
+        )?;
+
+        // Set period as open
+        tx.execute(
+            "UPDATE accounting_periods
+             SET is_closed = 0, closed_at = NULL
+             WHERE year = ?1 AND month = ?2",
+            params![year, month],
+        )?;
+
+        let audit = AuditLogEntry {
+            id: Uuid::new_v4(),
+            timestamp: now,
+            actor: "system".to_string(),
+            action: "PERIOD_REOPEN".to_string(),
+            resource_type: "PERIOD".to_string(),
+            resource_id: Some(format!("{year}-{month:02}")),
+            details: Some(format!("Reopened period {year}-{month:02}")),
+            client_ip: None,
+        };
+        Self::record_audit_log_tx(&tx, &audit)?;
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Non-destructively voids an active journal voucher per statutory audit requirements.
+    /// Checks that the voucher exists, has not already been voided, and belongs to an open accounting period.
+    /// Marks `status = 'VOIDED'`, records metadata, and writes a VOID_VOUCHER audit log entry.
+    pub fn void_voucher(
+        &self,
+        id: Uuid,
+        actor: &str,
+        reason: &str,
+        client_ip: Option<&str>,
+    ) -> Result<JournalVoucher, AccountingError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        // 1. Fetch voucher header
+        let (voucher_no, date_str, current_status): (String, String, String) = tx
+            .query_row(
+                "SELECT voucher_no, voucher_date, status FROM vouchers WHERE id = ?1",
+                params![id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?
+            .ok_or_else(|| AccountingError::VoucherNotFound(id.to_string()))?;
+
+        // 2. Check if already voided
+        if current_status == "VOIDED" {
+            return Err(AccountingError::VoucherAlreadyVoided { voucher_no });
+        }
+
+        let voucher_date = NaiveDate::parse_from_str(&date_str, "%Y-%m-%d").map_err(|e| {
+            AccountingError::DatabaseError(format!("Corrupt voucher date in database: {e}"))
+        })?;
+
+        // 3. Check period lock
+        let year = voucher_date.year();
+        let month = voucher_date.month();
+        let is_closed: bool = tx
+            .query_row(
+                "SELECT is_closed FROM accounting_periods WHERE year = ?1 AND month = ?2",
+                params![year, month],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(false);
+
+        if is_closed {
+            return Err(AccountingError::CannotVoidInClosedPeriod {
+                voucher_no,
+                year,
+                month,
+            });
+        }
+
+        // 4. Update status to VOIDED
+        let now = chrono::Utc::now().to_rfc3339();
+        tx.execute(
+            "UPDATE vouchers
+             SET status = 'VOIDED',
+                 voided_at = ?1,
+                 voided_by = ?2,
+                 void_reason = ?3
+             WHERE id = ?4",
+            params![now, actor, reason, id.to_string()],
+        )?;
+
+        // 5. Audit log
+        let audit = AuditLogEntry {
+            id: Uuid::new_v4(),
+            timestamp: now,
+            actor: actor.to_string(),
+            action: "VOID_VOUCHER".to_string(),
+            resource_type: "VOUCHER".to_string(),
+            resource_id: Some(voucher_no),
+            details: Some(reason.to_string()),
+            client_ip: client_ip.map(|s| s.to_string()),
+        };
+        Self::record_audit_log_tx(&tx, &audit)?;
+
+        tx.commit()?;
+        drop(conn);
+
+        // 6. Reload updated voucher
+        self.get_voucher(id)?
+            .ok_or_else(|| AccountingError::VoucherNotFound(id.to_string()))
+    }
+
+    /// Queries the immutable audit trail with optional filtering and pagination.
+    pub fn list_audit_logs(
+        &self,
+        query: &crate::dto::AuditLogQuery,
+    ) -> Result<Vec<AuditLogEntry>, AccountingError> {
+        let conn = self.conn.lock().unwrap();
+
+        let mut sql = "SELECT id, timestamp, actor, action, resource_type, resource_id, details, client_ip
+                       FROM audit_logs WHERE 1=1".to_string();
+        let mut params_vec: Vec<rusqlite::types::Value> = Vec::new();
+
+        if let Some(ref actor) = query.actor {
+            sql.push_str(" AND actor = ?");
+            params_vec.push(rusqlite::types::Value::Text(actor.clone()));
+        }
+        if let Some(ref action) = query.action {
+            sql.push_str(" AND action = ?");
+            params_vec.push(rusqlite::types::Value::Text(action.clone()));
+        }
+        if let Some(ref r_type) = query.resource_type {
+            sql.push_str(" AND resource_type = ?");
+            params_vec.push(rusqlite::types::Value::Text(r_type.clone()));
+        }
+        if let Some(ref r_id) = query.resource_id {
+            sql.push_str(" AND resource_id = ?");
+            params_vec.push(rusqlite::types::Value::Text(r_id.clone()));
+        }
+        if let Some(ref from_d) = query.from_date {
+            sql.push_str(" AND timestamp >= ?");
+            params_vec.push(rusqlite::types::Value::Text(from_d.clone()));
+        }
+        if let Some(ref to_d) = query.to_date {
+            sql.push_str(" AND timestamp <= ?");
+            params_vec.push(rusqlite::types::Value::Text(to_d.clone()));
+        }
+
+        sql.push_str(" ORDER BY timestamp DESC");
+
+        let limit = query.limit.unwrap_or(100).min(1000);
+        sql.push_str(&format!(" LIMIT {}", limit));
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), |row| {
+            let id_str: String = row.get(0)?;
+            let id = Uuid::parse_str(&id_str).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+            })?;
+            let timestamp: String = row.get(1)?;
+            let actor: String = row.get(2)?;
+            let action: String = row.get(3)?;
+            let resource_type: String = row.get(4)?;
+            let resource_id: Option<String> = row.get(5)?;
+            let details: Option<String> = row.get(6)?;
+            let client_ip: Option<String> = row.get(7)?;
+
+            Ok(AuditLogEntry {
+                id,
+                timestamp,
+                actor,
+                action,
+                resource_type,
+                resource_id,
+                details,
+                client_ip,
+            })
+        })?;
+
+        let mut entries = Vec::new();
+        for r in rows {
+            entries.push(r?);
+        }
+        Ok(entries)
+    }
+
+    /// Lists all accounting periods and their lock statuses sorted chronologically.
+    pub fn list_periods(&self) -> Result<Vec<AccountingPeriod>, AccountingError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT year, month, is_closed, closed_at
+             FROM accounting_periods
+             ORDER BY year ASC, month ASC",
+        )?;
+
+        let rows = stmt.query_map([], |row| {
+            let year: i32 = row.get(0)?;
+            let month: u32 = row.get(1)?;
+            let is_closed: bool = row.get(2)?;
+            let closed_at: Option<String> = row.get(3)?;
+
+            Ok(AccountingPeriod {
+                year,
+                month,
+                is_closed,
+                closed_at,
+            })
+        })?;
+
+        let mut periods = Vec::new();
+        for r in rows {
+            periods.push(r?);
+        }
+        Ok(periods)
+    }
+
+    /// Retrieves account balances across a specified date range, excluding closing vouchers and voided entries.
+    pub fn get_account_balances_for_range(
+        &self,
+        from_date: NaiveDate,
+        to_date: NaiveDate,
+    ) -> Result<BTreeMap<String, (Decimal, Decimal)>, AccountingError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT l.account_code, l.debit, l.credit
+             FROM voucher_lines l
+             JOIN vouchers v ON l.voucher_id = v.id
+             WHERE v.voucher_date >= ?1
+               AND v.voucher_date <= ?2
+               AND v.voucher_no NOT LIKE 'KC-%'
+               AND v.status = 'POSTED'
+             ORDER BY l.account_code ASC",
+        )?;
+
+        let from_str = from_date.to_string();
+        let to_str = to_date.to_string();
+
+        let rows = stmt.query_map(params![from_str, to_str], |row| {
+            let account_code: String = row.get(0)?;
+            let debit_str: String = row.get(1)?;
+            let credit_str: String = row.get(2)?;
+
+            let debit = Decimal::from_str(&debit_str).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(e))
+            })?;
+            let credit = Decimal::from_str(&credit_str).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e))
+            })?;
+
+            Ok((account_code, debit, credit))
+        })?;
+
+        let mut map = BTreeMap::new();
+        for r in rows {
+            let (account_code, debit, credit) = r?;
+            let entry = map.entry(account_code).or_insert((Decimal::ZERO, Decimal::ZERO));
+            entry.0 += debit;
+            entry.1 += credit;
+        }
+
+        Ok(map)
+    }
+
+    /// Computes the statutory Balance Sheet as of a specified date, strictly enforcing
+    /// the contra-asset deduction formula under Circular 99/2025/TT-BTC and isolating active POSTED vouchers.
+    pub fn compute_balance_sheet(
+        &self,
+        as_of_date: NaiveDate,
+    ) -> Result<BalanceSheetReport, AccountingError> {
+        let conn = self.conn.lock().unwrap();
+
+        let mut stmt = conn.prepare(
+            "SELECT l.account_code, l.debit, l.credit
+             FROM voucher_lines l
+             JOIN vouchers v ON l.voucher_id = v.id
+             WHERE v.voucher_date <= ?1
+               AND v.status = 'POSTED'",
+        )?;
+
+        let as_of_str = as_of_date.to_string();
+        let rows = stmt.query_map(params![as_of_str], |row| {
+            let account_code: String = row.get(0)?;
+            let debit_str: String = row.get(1)?;
+            let credit_str: String = row.get(2)?;
+
+            let debit = Decimal::from_str(&debit_str).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(e))
+            })?;
+            let credit = Decimal::from_str(&credit_str).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e))
+            })?;
+
+            Ok((account_code, debit, credit))
+        })?;
+
+        let mut balances: BTreeMap<String, (Decimal, Decimal)> = BTreeMap::new();
+        for r in rows {
+            let (account_code, debit, credit) = r?;
+            let entry = balances
+                .entry(account_code)
+                .or_insert((Decimal::ZERO, Decimal::ZERO));
+            entry.0 += debit;
+            entry.1 += credit;
+        }
+
+        let mut current_assets = Decimal::ZERO;
+        let mut non_current_assets = Decimal::ZERO;
+        let mut accumulated_depreciation = Decimal::ZERO;
+        let mut asset_provisions = Decimal::ZERO;
+        let mut liabilities = Decimal::ZERO;
+        let mut equity = Decimal::ZERO;
+
+        for (code, (debit, credit)) in &balances {
+            if code.starts_with("214") {
+                accumulated_depreciation += credit - debit;
+            } else if code.starts_with("229") {
+                asset_provisions += credit - debit;
+            } else if code.starts_with('1') {
+                current_assets += debit - credit;
+            } else if code.starts_with('2') {
+                non_current_assets += debit - credit;
+            } else if code.starts_with('3') {
+                liabilities += credit - debit;
+            } else if code.starts_with('4') {
+                equity += credit - debit;
+            }
+        }
+
+        let total_assets = current_assets + non_current_assets - (accumulated_depreciation + asset_provisions);
+        let total_resources = liabilities + equity;
+        let is_balanced = total_assets == total_resources;
+
+        Ok(BalanceSheetReport {
+            as_of_date,
+            current_assets,
+            non_current_assets,
+            accumulated_depreciation,
+            asset_provisions,
+            total_assets,
+            liabilities,
+            equity,
+            total_resources,
+            is_balanced,
+        })
+    }
+
+    /// Computes the statutory Income Statement across a specified date range, isolating active POSTED vouchers.
+    pub fn compute_income_statement(
+        &self,
+        from_date: NaiveDate,
+        to_date: NaiveDate,
+    ) -> Result<IncomeStatementReport, AccountingError> {
+        let conn = self.conn.lock().unwrap();
+
+        let mut stmt = conn.prepare(
+            "SELECT l.account_code, l.debit, l.credit
+             FROM voucher_lines l
+             JOIN vouchers v ON l.voucher_id = v.id
+             WHERE v.voucher_date >= ?1
+               AND v.voucher_date <= ?2
+               AND v.voucher_no NOT LIKE 'KC-%'
+               AND v.status = 'POSTED'",
+        )?;
+
+        let from_str = from_date.to_string();
+        let to_str = to_date.to_string();
+
+        let rows = stmt.query_map(params![from_str, to_str], |row| {
+            let account_code: String = row.get(0)?;
+            let debit_str: String = row.get(1)?;
+            let credit_str: String = row.get(2)?;
+
+            let debit = Decimal::from_str(&debit_str).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(e))
+            })?;
+            let credit = Decimal::from_str(&credit_str).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e))
+            })?;
+
+            Ok((account_code, debit, credit))
+        })?;
+
+        let mut gross_revenue = Decimal::ZERO;
+        let mut revenue_deductions = Decimal::ZERO;
+        let mut cost_of_goods_sold = Decimal::ZERO;
+        let mut financial_income = Decimal::ZERO;
+        let mut financial_expenses = Decimal::ZERO;
+        let mut selling_expenses = Decimal::ZERO;
+        let mut administrative_expenses = Decimal::ZERO;
+        let mut other_income = Decimal::ZERO;
+        let mut other_expenses = Decimal::ZERO;
+        let mut corporate_tax = Decimal::ZERO;
+
+        for r in rows {
+            let (code, debit, credit) = r?;
+            if code.starts_with("511") {
+                gross_revenue += credit - debit;
+            } else if code.starts_with("521") {
+                revenue_deductions += debit - credit;
+            } else if code.starts_with("632") {
+                cost_of_goods_sold += debit - credit;
+            } else if code.starts_with("515") {
+                financial_income += credit - debit;
+            } else if code.starts_with("635") {
+                financial_expenses += debit - credit;
+            } else if code.starts_with("641") {
+                selling_expenses += debit - credit;
+            } else if code.starts_with("642") {
+                administrative_expenses += debit - credit;
+            } else if code.starts_with("711") {
+                other_income += credit - debit;
+            } else if code.starts_with("811") {
+                other_expenses += debit - credit;
+            } else if code.starts_with("821") {
+                corporate_tax += debit - credit;
+            }
+        }
+
+        let net_revenue = gross_revenue - revenue_deductions;
+        let gross_profit = net_revenue - cost_of_goods_sold;
+        let operating_profit = gross_profit + financial_income
+            - financial_expenses
+            - selling_expenses
+            - administrative_expenses;
+        let net_profit_before_tax = operating_profit + (other_income - other_expenses);
+        let net_profit_after_tax = net_profit_before_tax - corporate_tax;
+
+        Ok(IncomeStatementReport {
+            from_date,
+            to_date,
+            gross_revenue,
+            revenue_deductions,
+            net_revenue,
+            cost_of_goods_sold,
+            gross_profit,
+            financial_income,
+            financial_expenses,
+            selling_expenses,
+            administrative_expenses,
+            operating_profit,
+            other_income,
+            other_expenses,
+            net_profit_before_tax,
+            corporate_tax,
+            net_profit_after_tax,
+        })
+    }
+
+    /// Retrieves a single voucher with all its constituent lines and audit attribution metadata by ID.
+    pub fn get_voucher(&self, id: Uuid) -> Result<Option<JournalVoucher>, AccountingError> {
+        let conn = self.conn.lock().unwrap();
+
+        let header = conn.query_row(
+            "SELECT id, voucher_no, voucher_date, description, invoice_ref,
+                    status, created_by, approved_by, voided_at, voided_by, void_reason, created_at
+             FROM vouchers WHERE id = ?1",
+            params![id.to_string()],
+            |row| {
+                let id_str: String = row.get(0)?;
+                let voucher_no: String = row.get(1)?;
+                let date_str: String = row.get(2)?;
+                let description: String = row.get(3)?;
+                let invoice_ref: Option<String> = row.get(4)?;
+                let status_str: String = row.get(5)?;
+                let created_by: String = row.get(6)?;
+                let approved_by: Option<String> = row.get(7)?;
+                let voided_at: Option<String> = row.get(8)?;
+                let voided_by: Option<String> = row.get(9)?;
+                let void_reason: Option<String> = row.get(10)?;
+                let created_at: String = row.get(11)?;
+
+                let parsed_id = Uuid::parse_str(&id_str).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+                })?;
+                let parsed_date = NaiveDate::parse_from_str(&date_str, "%Y-%m-%d").map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e))
+                })?;
+                let status = VoucherStatus::from_str(&status_str).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        5,
+                        rusqlite::types::Type::Text,
+                        Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+                    )
+                })?;
+
+                Ok((
+                    parsed_id,
+                    voucher_no,
+                    parsed_date,
+                    description,
+                    invoice_ref,
+                    status,
+                    created_by,
+                    approved_by,
+                    voided_at,
+                    voided_by,
+                    void_reason,
+                    created_at,
+                ))
+            },
+        );
+
+        let (
+            voucher_id,
+            voucher_no,
+            voucher_date,
+            description,
+            invoice_ref,
+            status,
+            created_by,
+            approved_by,
+            voided_at,
+            voided_by,
+            void_reason,
+            created_at,
+        ) = match header {
+            Ok(data) => data,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+            Err(e) => return Err(AccountingError::from(e)),
+        };
+
+        let mut line_stmt = conn.prepare(
+            "SELECT id, line_no, account_code, debit, credit, line_desc
+             FROM voucher_lines WHERE voucher_id = ?1
+             ORDER BY line_no ASC, rowid ASC",
+        )?;
+
+        let line_iter = line_stmt.query_map(params![voucher_id.to_string()], |row| {
+            let line_id_str: String = row.get(0)?;
+            let line_no: u32 = row.get(1)?;
+            let account_code: String = row.get(2)?;
+            let debit_str: String = row.get(3)?;
+            let credit_str: String = row.get(4)?;
+            let line_desc: Option<String> = row.get(5)?;
+
+            let line_id = Uuid::parse_str(&line_id_str).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+            })?;
+            let debit = Decimal::from_str(&debit_str).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(e))
+            })?;
+            let credit = Decimal::from_str(&credit_str).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(e))
+            })?;
+
+            Ok(VoucherLine {
+                id: line_id,
+                line_no,
+                account_code,
+                debit,
+                credit,
+                line_desc,
+            })
+        })?;
+
+        let mut lines = Vec::new();
+        for line_res in line_iter {
+            lines.push(line_res?);
+        }
+
+        Ok(Some(JournalVoucher {
+            id: voucher_id,
+            voucher_no,
+            voucher_date,
+            description,
+            invoice_ref,
+            status,
+            created_by,
+            approved_by,
+            voided_at,
+            voided_by,
+            void_reason,
+            created_at,
+            lines,
+        }))
+    }
+
+    /// Retrieves active POSTED historical vouchers within an optional date range [from_date, to_date].
+    pub fn list_vouchers(
+        &self,
+        from_date: Option<NaiveDate>,
+        to_date: Option<NaiveDate>,
+    ) -> Result<Vec<JournalVoucher>, AccountingError> {
+        let conn = self.conn.lock().unwrap();
+
+        let from_str = from_date.map(|d| d.to_string());
+        let to_str = to_date.map(|d| d.to_string());
+
+        let mut stmt = conn.prepare(
+            "SELECT id, voucher_no, voucher_date, description, invoice_ref,
+                    status, created_by, approved_by, voided_at, voided_by, void_reason, created_at
+             FROM vouchers
+             WHERE status = 'POSTED'
+               AND (?1 IS NULL OR voucher_date >= ?1)
+               AND (?2 IS NULL OR voucher_date <= ?2)
+             ORDER BY voucher_date ASC, voucher_no ASC",
+        )?;
+
+        let header_rows = stmt.query_map(params![from_str, to_str], |row| {
+            let id_str: String = row.get(0)?;
+            let voucher_no: String = row.get(1)?;
+            let date_str: String = row.get(2)?;
+            let description: String = row.get(3)?;
+            let invoice_ref: Option<String> = row.get(4)?;
+            let status_str: String = row.get(5)?;
+            let created_by: String = row.get(6)?;
+            let approved_by: Option<String> = row.get(7)?;
+            let voided_at: Option<String> = row.get(8)?;
+            let voided_by: Option<String> = row.get(9)?;
+            let void_reason: Option<String> = row.get(10)?;
+            let created_at: String = row.get(11)?;
+
+            let parsed_id = Uuid::parse_str(&id_str).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+            })?;
+            let parsed_date = NaiveDate::parse_from_str(&date_str, "%Y-%m-%d").map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e))
+            })?;
+            let status = VoucherStatus::from_str(&status_str).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    5,
+                    rusqlite::types::Type::Text,
+                    Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+                )
+            })?;
+
+            Ok((
+                parsed_id,
+                voucher_no,
+                parsed_date,
+                description,
+                invoice_ref,
+                status,
+                created_by,
+                approved_by,
+                voided_at,
+                voided_by,
+                void_reason,
+                created_at,
+            ))
+        })?;
+
+        let mut headers = Vec::new();
+        for h in header_rows {
+            headers.push(h?);
+        }
+
+        let mut vouchers = Vec::with_capacity(headers.len());
+        let mut line_stmt = conn.prepare(
+            "SELECT id, line_no, account_code, debit, credit, line_desc
+             FROM voucher_lines WHERE voucher_id = ?1
+             ORDER BY line_no ASC, rowid ASC",
+        )?;
+
+        for (
+            v_id,
+            v_no,
+            v_date,
+            desc,
+            inv_ref,
+            status,
+            created_by,
+            approved_by,
+            voided_at,
+            voided_by,
+            void_reason,
+            created_at,
+        ) in headers
+        {
+            let line_iter = line_stmt.query_map(params![v_id.to_string()], |row| {
+                let line_id_str: String = row.get(0)?;
+                let line_no: u32 = row.get(1)?;
+                let account_code: String = row.get(2)?;
+                let debit_str: String = row.get(3)?;
+                let credit_str: String = row.get(4)?;
+                let line_desc: Option<String> = row.get(5)?;
+
+                let line_id = Uuid::parse_str(&line_id_str).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+                })?;
+                let debit = Decimal::from_str(&debit_str).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(e))
+                })?;
+                let credit = Decimal::from_str(&credit_str).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(e))
+                })?;
+
+                Ok(VoucherLine {
+                    id: line_id,
+                    line_no,
+                    account_code,
+                    debit,
+                    credit,
+                    line_desc,
+                })
+            })?;
+
+            let mut lines = Vec::new();
+            for l in line_iter {
+                lines.push(l?);
+            }
+
+            vouchers.push(JournalVoucher {
+                id: v_id,
+                voucher_no: v_no,
+                voucher_date: v_date,
+                description: desc,
+                invoice_ref: inv_ref,
+                status,
+                created_by,
+                approved_by,
+                voided_at,
+                voided_by,
+                void_reason,
+                created_at,
+                lines,
+            });
+        }
+
+        Ok(vouchers)
+    }
+
+    /// Computes the statutory Trial Balance across all active POSTED vouchers.
+    pub fn compute_trial_balance(&self) -> Result<Vec<TrialBalanceRow>, AccountingError> {
+        let conn = self.conn.lock().unwrap();
+
+        let mut stmt = conn.prepare(
+            "SELECT l.account_code, l.debit, l.credit
+             FROM voucher_lines l
+             JOIN vouchers v ON l.voucher_id = v.id
+             WHERE v.status = 'POSTED'
+             ORDER BY l.account_code ASC",
+        )?;
+
+        let mut map: BTreeMap<String, (Decimal, Decimal)> = BTreeMap::new();
+
+        let rows = stmt.query_map([], |row| {
+            let account_code: String = row.get(0)?;
+            let debit_str: String = row.get(1)?;
+            let credit_str: String = row.get(2)?;
+
+            let debit = Decimal::from_str(&debit_str).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(e))
+            })?;
+            let credit = Decimal::from_str(&credit_str).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e))
+            })?;
+
+            Ok((account_code, debit, credit))
+        })?;
+
+        for r in rows {
+            let (account_code, debit, credit) = r?;
+            let entry = map
+                .entry(account_code)
+                .or_insert((Decimal::ZERO, Decimal::ZERO));
+            entry.0 += debit;
+            entry.1 += credit;
+        }
+
+        let trial_balance_rows = map
+            .into_iter()
+            .map(|(account_code, (total_debit, total_credit))| {
+                let net_balance = total_debit - total_credit;
+                TrialBalanceRow {
+                    account_code,
+                    total_debit,
+                    total_credit,
+                    net_balance,
+                }
+            })
+            .collect();
+
+        Ok(trial_balance_rows)
+    }
+
+    /// Creates an atomic live SQLite snapshot using `VACUUM INTO ?1`.
+    /// Handles stale existing files, ensures parent directories exist,
+    /// records a SYSTEM_BACKUP audit log event, and returns the backup file size in bytes.
+    pub fn create_backup(&self, destination_path: &str) -> Result<u64, AccountingError> {
+        if destination_path.trim().is_empty() {
+            return Err(AccountingError::DatabaseError(
+                "Destination path cannot be empty".to_string(),
+            ));
+        }
+
+        let dest = std::path::Path::new(destination_path);
+        if let Some(parent) = dest.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                AccountingError::DatabaseError(format!(
+                    "Failed to create backup directory: {}",
+                    e
+                ))
+            })?;
+        }
+
+        if dest.exists() {
+            std::fs::remove_file(dest).map_err(|e| {
+                AccountingError::DatabaseError(format!(
+                    "Failed to remove stale backup file: {}",
+                    e
+                ))
+            })?;
+        }
+
+        let conn = self.conn.lock().unwrap();
+        conn.execute("VACUUM INTO ?1;", params![destination_path])?;
+
+        let metadata = std::fs::metadata(destination_path).map_err(|e| {
+            AccountingError::DatabaseError(format!(
+                "Failed to read backup file metadata: {}",
+                e
+            ))
+        })?;
+
+        let file_size_bytes = metadata.len();
+
+        // Record immutable audit event for backup
+        let _ = conn.execute(
+            "INSERT INTO audit_logs (id, timestamp, actor, action, resource_type, resource_id, details, client_ip)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                Uuid::new_v4().to_string(),
+                chrono::Utc::now().to_rfc3339(),
+                "system",
+                "SYSTEM_BACKUP",
+                "SYSTEM",
+                destination_path,
+                format!("Created live backup snapshot ({file_size_bytes} bytes)"),
+                Option::<String>::None,
+            ],
+        );
+
+        Ok(file_size_bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ledger::LedgerEngine;
+    use crate::models::{JournalVoucher, VoucherLine, VoucherStatus};
+    use chrono::NaiveDate;
+    use rusqlite::Connection;
+    use rust_decimal_macros::dec;
+    use uuid::Uuid;
+
+    #[test]
+    fn test_init_and_save_compound_voucher() {
+        let conn = Connection::open_in_memory().unwrap();
+        let repo = LedgerRepository::new(conn);
+        repo.init_schema().unwrap();
+
+        let engine = LedgerEngine::new();
+
+        let voucher_id = Uuid::new_v4();
+        let voucher = JournalVoucher {
+            id: voucher_id,
+            voucher_no: "PNK-2026-0001".to_string(),
+            voucher_date: NaiveDate::from_ymd_opt(2026, 1, 10).unwrap(),
+            description: "Nhập kho nguyên vật liệu từ Công ty XYZ".to_string(),
+            invoice_ref: Some("HD-XYZ-991".to_string()),
+            status: VoucherStatus::Posted,
+            created_by: "accountant_lan".to_string(),
+            approved_by: Some("chief_acc_hung".to_string()),
+            voided_at: None,
+            voided_by: None,
+            void_reason: None,
+            created_at: "2026-01-10T08:30:00Z".to_string(),
+            lines: vec![
+                VoucherLine {
+                    id: Uuid::new_v4(),
+                    line_no: 1,
+                    account_code: "152".to_string(),
+                    debit: dec!(50000000),
+                    credit: dec!(0),
+                    line_desc: Some("Nguyên vật liệu A".to_string()),
+                },
+                VoucherLine {
+                    id: Uuid::new_v4(),
+                    line_no: 2,
+                    account_code: "1331".to_string(),
+                    debit: dec!(5000000),
+                    credit: dec!(0),
+                    line_desc: Some("Thuế GTGT đầu vào 10%".to_string()),
+                },
+                VoucherLine {
+                    id: Uuid::new_v4(),
+                    line_no: 3,
+                    account_code: "331".to_string(),
+                    debit: dec!(0),
+                    credit: dec!(55000000),
+                    line_desc: Some("Phải trả NCC XYZ".to_string()),
+                },
+            ],
+        };
+
+        assert!(engine.validate_voucher(&voucher).is_ok());
+        repo.save_voucher(&voucher).unwrap();
+
+        let retrieved = repo
+            .get_voucher(voucher_id)
+            .unwrap()
+            .expect("Voucher must exist in database");
+        assert_eq!(retrieved.voucher_no, "PNK-2026-0001");
+        assert_eq!(
+            retrieved.voucher_date,
+            NaiveDate::from_ymd_opt(2026, 1, 10).unwrap()
+        );
+        assert_eq!(retrieved.status, VoucherStatus::Posted);
+        assert_eq!(retrieved.created_by, "accountant_lan");
+        assert_eq!(retrieved.approved_by, Some("chief_acc_hung".to_string()));
+        assert_eq!(retrieved.lines.len(), 3);
+        assert_eq!(retrieved.lines[0].line_no, 1);
+        assert_eq!(retrieved.lines[0].account_code, "152");
+        assert_eq!(retrieved.lines[0].debit, dec!(50000000));
+        assert_eq!(retrieved.lines[2].line_no, 3);
+        assert_eq!(retrieved.lines[2].account_code, "331");
+        assert_eq!(retrieved.lines[2].credit, dec!(55000000));
+    }
+
+    #[test]
+    fn test_list_vouchers_with_date_filter() {
+        let conn = Connection::open_in_memory().unwrap();
+        let repo = LedgerRepository::new(conn);
+        repo.init_schema().unwrap();
+
+        let v1 = JournalVoucher {
+            id: Uuid::new_v4(),
+            voucher_no: "V-001".to_string(),
+            voucher_date: NaiveDate::from_ymd_opt(2026, 1, 10).unwrap(),
+            description: "Jan 10 transaction".to_string(),
+            invoice_ref: None,
+            status: VoucherStatus::Posted,
+            created_by: "system".to_string(),
+            approved_by: None,
+            voided_at: None,
+            voided_by: None,
+            void_reason: None,
+            created_at: "2026-01-10T00:00:00Z".to_string(),
+            lines: vec![
+                VoucherLine {
+                    id: Uuid::new_v4(),
+                    line_no: 1,
+                    account_code: "1111".to_string(),
+                    debit: dec!(100),
+                    credit: dec!(0),
+                    line_desc: None,
+                },
+                VoucherLine {
+                    id: Uuid::new_v4(),
+                    line_no: 2,
+                    account_code: "1121".to_string(),
+                    debit: dec!(0),
+                    credit: dec!(100),
+                    line_desc: None,
+                },
+            ],
+        };
+
+        let v2 = JournalVoucher {
+            id: Uuid::new_v4(),
+            voucher_no: "V-002".to_string(),
+            voucher_date: NaiveDate::from_ymd_opt(2026, 1, 20).unwrap(),
+            description: "Jan 20 transaction".to_string(),
+            invoice_ref: None,
+            status: VoucherStatus::Posted,
+            created_by: "system".to_string(),
+            approved_by: None,
+            voided_at: None,
+            voided_by: None,
+            void_reason: None,
+            created_at: "2026-01-20T00:00:00Z".to_string(),
+            lines: vec![
+                VoucherLine {
+                    id: Uuid::new_v4(),
+                    line_no: 1,
+                    account_code: "1111".to_string(),
+                    debit: dec!(200),
+                    credit: dec!(0),
+                    line_desc: None,
+                },
+                VoucherLine {
+                    id: Uuid::new_v4(),
+                    line_no: 2,
+                    account_code: "1121".to_string(),
+                    debit: dec!(0),
+                    credit: dec!(200),
+                    line_desc: None,
+                },
+            ],
+        };
+
+        let v3 = JournalVoucher {
+            id: Uuid::new_v4(),
+            voucher_no: "V-003".to_string(),
+            voucher_date: NaiveDate::from_ymd_opt(2026, 2, 5).unwrap(),
+            description: "Feb 5 transaction".to_string(),
+            invoice_ref: None,
+            status: VoucherStatus::Posted,
+            created_by: "system".to_string(),
+            approved_by: None,
+            voided_at: None,
+            voided_by: None,
+            void_reason: None,
+            created_at: "2026-02-05T00:00:00Z".to_string(),
+            lines: vec![
+                VoucherLine {
+                    id: Uuid::new_v4(),
+                    line_no: 1,
+                    account_code: "1111".to_string(),
+                    debit: dec!(300),
+                    credit: dec!(0),
+                    line_desc: None,
+                },
+                VoucherLine {
+                    id: Uuid::new_v4(),
+                    line_no: 2,
+                    account_code: "1121".to_string(),
+                    debit: dec!(0),
+                    credit: dec!(300),
+                    line_desc: None,
+                },
+            ],
+        };
+
+        repo.save_voucher(&v1).unwrap();
+        repo.save_voucher(&v2).unwrap();
+        repo.save_voucher(&v3).unwrap();
+
+        // 1. All vouchers
+        let all = repo.list_vouchers(None, None).unwrap();
+        assert_eq!(all.len(), 3);
+
+        // 2. Filter Jan 15 to Jan 25 -> only v2
+        let filtered = repo
+            .list_vouchers(
+                Some(NaiveDate::from_ymd_opt(2026, 1, 15).unwrap()),
+                Some(NaiveDate::from_ymd_opt(2026, 1, 25).unwrap()),
+            )
+            .unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].voucher_no, "V-002");
+
+        // 3. Filter from Jan 15 onwards -> v2 and v3
+        let from_jan15 = repo
+            .list_vouchers(
+                Some(NaiveDate::from_ymd_opt(2026, 1, 15).unwrap()),
+                None,
+            )
+            .unwrap();
+        assert_eq!(from_jan15.len(), 2);
+    }
+
+    #[test]
+    fn test_compute_trial_balance() {
+        let conn = Connection::open_in_memory().unwrap();
+        let repo = LedgerRepository::new(conn);
+        repo.init_schema().unwrap();
+
+        let empty_tb = repo.compute_trial_balance().unwrap();
+        assert!(empty_tb.is_empty());
+
+        let v = JournalVoucher {
+            id: Uuid::new_v4(),
+            voucher_no: "V-001".to_string(),
+            voucher_date: NaiveDate::from_ymd_opt(2026, 1, 10).unwrap(),
+            description: "Materials purchase".to_string(),
+            invoice_ref: None,
+            status: VoucherStatus::Posted,
+            created_by: "system".to_string(),
+            approved_by: None,
+            voided_at: None,
+            voided_by: None,
+            void_reason: None,
+            created_at: "2026-01-10T00:00:00Z".to_string(),
+            lines: vec![
+                VoucherLine {
+                    id: Uuid::new_v4(),
+                    line_no: 1,
+                    account_code: "152".to_string(),
+                    debit: dec!(1000),
+                    credit: dec!(0),
+                    line_desc: None,
+                },
+                VoucherLine {
+                    id: Uuid::new_v4(),
+                    line_no: 2,
+                    account_code: "1331".to_string(),
+                    debit: dec!(100),
+                    credit: dec!(0),
+                    line_desc: None,
+                },
+                VoucherLine {
+                    id: Uuid::new_v4(),
+                    line_no: 3,
+                    account_code: "331".to_string(),
+                    debit: dec!(0),
+                    credit: dec!(1100),
+                    line_desc: None,
+                },
+            ],
+        };
+        repo.save_voucher(&v).unwrap();
+
+        let tb = repo.compute_trial_balance().unwrap();
+        assert_eq!(tb.len(), 3);
+        assert_eq!(tb[0].account_code, "1331");
+        assert_eq!(tb[0].total_debit, dec!(100));
+        assert_eq!(tb[0].total_credit, dec!(0));
+        assert_eq!(tb[0].net_balance, dec!(100));
+
+        assert_eq!(tb[1].account_code, "152");
+        assert_eq!(tb[1].total_debit, dec!(1000));
+        assert_eq!(tb[1].total_credit, dec!(0));
+        assert_eq!(tb[1].net_balance, dec!(1000));
+
+        assert_eq!(tb[2].account_code, "331");
+        assert_eq!(tb[2].total_debit, dec!(0));
+        assert_eq!(tb[2].total_credit, dec!(1100));
+        assert_eq!(tb[2].net_balance, dec!(-1100));
+    }
+
+    #[test]
+    fn test_period_lock_and_lifecycle() {
+        let conn = Connection::open_in_memory().unwrap();
+        let repo = LedgerRepository::new(conn);
+        repo.init_schema().unwrap();
+
+        assert!(!repo.is_period_closed(2026, 1).unwrap());
+
+        let closing_voucher = JournalVoucher {
+            id: Uuid::new_v4(),
+            voucher_no: "KC-2026-01".to_string(),
+            voucher_date: NaiveDate::from_ymd_opt(2026, 1, 31).unwrap(),
+            description: "Closing voucher".to_string(),
+            invoice_ref: None,
+            status: VoucherStatus::Posted,
+            created_by: "system".to_string(),
+            approved_by: None,
+            voided_at: None,
+            voided_by: None,
+            void_reason: None,
+            created_at: "2026-01-31T23:59:59Z".to_string(),
+            lines: vec![
+                VoucherLine {
+                    id: Uuid::new_v4(),
+                    line_no: 1,
+                    account_code: "911".to_string(),
+                    debit: dec!(1000),
+                    credit: dec!(0),
+                    line_desc: None,
+                },
+                VoucherLine {
+                    id: Uuid::new_v4(),
+                    line_no: 2,
+                    account_code: "4212".to_string(),
+                    debit: dec!(0),
+                    credit: dec!(1000),
+                    line_desc: None,
+                },
+            ],
+        };
+
+        repo.close_period(2026, 1, &closing_voucher).unwrap();
+        assert!(repo.is_period_closed(2026, 1).unwrap());
+
+        // Attempting to close again returns PeriodAlreadyClosed
+        assert_eq!(
+            repo.close_period(2026, 1, &closing_voucher).unwrap_err(),
+            AccountingError::PeriodAlreadyClosed {
+                year: 2026,
+                month: 1
+            }
+        );
+
+        // Attempting to post into closed period returns PeriodClosed
+        let v_late = JournalVoucher {
+            id: Uuid::new_v4(),
+            voucher_no: "V-LATE".to_string(),
+            voucher_date: NaiveDate::from_ymd_opt(2026, 1, 15).unwrap(),
+            description: "Late voucher".to_string(),
+            invoice_ref: None,
+            status: VoucherStatus::Posted,
+            created_by: "system".to_string(),
+            approved_by: None,
+            voided_at: None,
+            voided_by: None,
+            void_reason: None,
+            created_at: "2026-01-15T00:00:00Z".to_string(),
+            lines: vec![
+                VoucherLine {
+                    id: Uuid::new_v4(),
+                    line_no: 1,
+                    account_code: "1111".to_string(),
+                    debit: dec!(100),
+                    credit: dec!(0),
+                    line_desc: None,
+                },
+                VoucherLine {
+                    id: Uuid::new_v4(),
+                    line_no: 2,
+                    account_code: "1121".to_string(),
+                    debit: dec!(0),
+                    credit: dec!(100),
+                    line_desc: None,
+                },
+            ],
+        };
+        assert_eq!(
+            repo.save_voucher(&v_late).unwrap_err(),
+            AccountingError::PeriodClosed {
+                year: 2026,
+                month: 1
+            }
+        );
+
+        // Reopen period
+        repo.reopen_period(2026, 1).unwrap();
+        assert!(!repo.is_period_closed(2026, 1).unwrap());
+
+        // Verify closing voucher is now VOIDED and still present
+        let voided_kc = repo.get_voucher(closing_voucher.id).unwrap().unwrap();
+        assert_eq!(voided_kc.status, VoucherStatus::Voided);
+        assert_eq!(voided_kc.void_reason, Some("Period reopened".to_string()));
+
+        // Reopen again returns PeriodNotClosed
+        assert_eq!(
+            repo.reopen_period(2026, 1).unwrap_err(),
+            AccountingError::PeriodNotClosed {
+                year: 2026,
+                month: 1
+            }
+        );
+
+        // Now posting into period succeeds
+        repo.save_voucher(&v_late).unwrap();
+    }
+
+    #[test]
+    fn test_void_voucher_and_audit_log_capture() {
+        let conn = Connection::open_in_memory().unwrap();
+        let repo = LedgerRepository::new(conn);
+        repo.init_schema().unwrap();
+
+        let v_id = Uuid::new_v4();
+        let v = JournalVoucher {
+            id: v_id,
+            voucher_no: "V-AUDIT-01".to_string(),
+            voucher_date: NaiveDate::from_ymd_opt(2026, 1, 10).unwrap(),
+            description: "To be voided".to_string(),
+            invoice_ref: None,
+            status: VoucherStatus::Posted,
+            created_by: "accountant_lan".to_string(),
+            approved_by: None,
+            voided_at: None,
+            voided_by: None,
+            void_reason: None,
+            created_at: "2026-01-10T08:00:00Z".to_string(),
+            lines: vec![
+                VoucherLine {
+                    id: Uuid::new_v4(),
+                    line_no: 1,
+                    account_code: "1111".to_string(),
+                    debit: dec!(5000),
+                    credit: dec!(0),
+                    line_desc: None,
+                },
+                VoucherLine {
+                    id: Uuid::new_v4(),
+                    line_no: 2,
+                    account_code: "1121".to_string(),
+                    debit: dec!(0),
+                    credit: dec!(5000),
+                    line_desc: None,
+                },
+            ],
+        };
+
+        repo.save_voucher(&v).unwrap();
+
+        // Trial balance includes it
+        let tb = repo.compute_trial_balance().unwrap();
+        assert_eq!(tb.len(), 2);
+
+        // Void the voucher
+        let voided = repo
+            .void_voucher(v_id, "cfo_minh", "Duplicate transaction entry", Some("127.0.0.1"))
+            .unwrap();
+        assert_eq!(voided.status, VoucherStatus::Voided);
+        assert_eq!(voided.voided_by, Some("cfo_minh".to_string()));
+        assert_eq!(voided.void_reason, Some("Duplicate transaction entry".to_string()));
+
+        // Trial balance excludes it!
+        let tb_after = repo.compute_trial_balance().unwrap();
+        assert!(tb_after.is_empty());
+
+        // Cannot void again
+        assert_eq!(
+            repo.void_voucher(v_id, "cfo_minh", "Again", None).unwrap_err(),
+            AccountingError::VoucherAlreadyVoided {
+                voucher_no: "V-AUDIT-01".to_string()
+            }
+        );
+
+        // Audit logs recorded CREATE_VOUCHER and VOID_VOUCHER
+        let logs = repo.list_audit_logs(&crate::dto::AuditLogQuery::default()).unwrap();
+        assert_eq!(logs.len(), 2);
+        assert_eq!(logs[0].action, "VOID_VOUCHER");
+        assert_eq!(logs[0].actor, "cfo_minh");
+        assert_eq!(logs[0].client_ip, Some("127.0.0.1".to_string()));
+        assert_eq!(logs[1].action, "CREATE_VOUCHER");
+        assert_eq!(logs[1].actor, "accountant_lan");
+    }
+
+    #[test]
+    fn test_sqlite_pragmas_and_backup() {
+        let conn = Connection::open_in_memory().unwrap();
+        let repo = LedgerRepository::new(conn);
+        repo.init_schema().unwrap();
+
+        // Verify pragmas
+        {
+            let conn_guard = repo.conn.lock().unwrap();
+            let busy_timeout: i64 = conn_guard
+                .query_row("PRAGMA busy_timeout;", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(busy_timeout, 5000);
+
+            let foreign_keys: i64 = conn_guard
+                .query_row("PRAGMA foreign_keys;", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(foreign_keys, 1);
+        }
+
+        // Test create_backup to temp dir
+        let temp_dir = std::env::temp_dir().join(format!("test_backup_{}", Uuid::new_v4()));
+        let backup_file = temp_dir.join("snapshot.db");
+        let backup_path = backup_file.to_str().unwrap();
+
+        let size = repo.create_backup(backup_path).expect("create_backup should succeed");
+        assert!(size > 0);
+        assert!(backup_file.exists());
+
+        // Test stale file handling (overwriting existing file)
+        let size2 = repo.create_backup(backup_path).expect("create_backup overwrite should succeed");
+        assert!(size2 > 0);
+
+        // Verify audit log captured SYSTEM_BACKUP
+        let logs = repo
+            .list_audit_logs(&crate::dto::AuditLogQuery {
+                action: Some("SYSTEM_BACKUP".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(logs.len(), 2);
+        assert_eq!(logs[0].action, "SYSTEM_BACKUP");
+
+        // Clean up
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+}

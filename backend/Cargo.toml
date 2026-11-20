@@ -1,0 +1,31 @@
+[package]
+name = "backend"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = { version = "0.8", features = ["macros"] }
+tokio = { version = "1.43", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", features = ["serde"] }
+rust_decimal = { version = "1.43", features = ["serde"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+thiserror = "2.0.21"
+serde_json = "1.0"
+tower = { version = "0.5", features = ["util"] }
+
+[dev-dependencies]
+rust_decimal_macros = "1.40.0"
+proptest = "1.6"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+

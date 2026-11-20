@@ -1,0 +1,10 @@
+/target
+/backend/target
+/_verify
+/.agents
+/.codegraph
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+.env*
