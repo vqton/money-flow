@@ -151,6 +151,30 @@ pub struct BackupResponse {
     pub created_at: String,
 }
 
+/// Request payload for restoring the accounting database from a snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RestoreRequest {
+    /// Filesystem path to the validated SQLite snapshot file.
+    pub snapshot_path: String,
+    /// Explicit confirmation flag required to prevent accidental data overwrite.
+    pub confirm_overwrite: bool,
+    /// Expected SHA-256 checksum (hex-encoded, 64 characters) of the snapshot file.
+    pub expected_sha256: String,
+}
+
+/// Response payload for a successfully executed disaster restore operation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RestoreResponse {
+    /// Status confirmation (e.g., "RESTORED").
+    pub status: String,
+    /// RFC-3339 UTC timestamp when the restore committed.
+    pub timestamp: String,
+    /// Path of the snapshot file that was restored.
+    pub restored_from_snapshot: String,
+    /// Verified SHA-256 checksum of the restored snapshot.
+    pub sha256_checksum: String,
+}
+
 /// Request payload for voiding / cancelling an active journal voucher.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VoidVoucherRequest {
@@ -335,6 +359,15 @@ pub enum ApiError {
 
     #[error("Forbidden: {0}")]
     Forbidden(String),
+
+    #[error("Unknown account: {0}")]
+    UnknownAccount(String),
+
+    #[error("Account inactive: {0}")]
+    InactiveAccount(String),
+
+    #[error("Unprocessable entity: {0}")]
+    UnprocessableEntity(String),
 }
 
 impl IntoResponse for ApiError {
@@ -362,6 +395,21 @@ impl IntoResponse for ApiError {
             ApiError::CannotVoidInClosedPeriod(ref msg) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "CANNOT_VOID_IN_CLOSED_PERIOD",
+                msg.as_str(),
+            ),
+            ApiError::UnknownAccount(ref msg) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "UNKNOWN_ACCOUNT",
+                msg.as_str(),
+            ),
+            ApiError::InactiveAccount(ref msg) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "ACCOUNT_INACTIVE",
+                msg.as_str(),
+            ),
+            ApiError::UnprocessableEntity(ref msg) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "UNPROCESSABLE_ENTITY",
                 msg.as_str(),
             ),
             ApiError::BadRequest(ref msg) => (StatusCode::BAD_REQUEST, "BAD_REQUEST", msg.as_str()),
@@ -462,6 +510,17 @@ impl From<AccountingError> for ApiError {
                 "Idempotency conflict for key '{}': request payload does not match original request",
                 key
             )),
+            AccountingError::UnknownAccount { account_code } => ApiError::UnknownAccount(format!(
+                "Account {} does not exist in chart of accounts",
+                account_code
+            )),
+            AccountingError::InactiveAccount { account_code } => {
+                ApiError::InactiveAccount(format!("Account {} is inactive", account_code))
+            }
+            AccountingError::DuplicateAccount(msg) => ApiError::Conflict(msg),
+            AccountingError::ParentAccountNotFound(msg) => ApiError::BadRequest(msg),
+            AccountingError::ParentAccountInactive(msg) => ApiError::UnprocessableEntity(msg),
+            AccountingError::CircularAccountReference(msg) => ApiError::BadRequest(msg),
             AccountingError::DatabaseError(msg) => {
                 if msg.contains("UNIQUE constraint failed: vouchers.voucher_no") {
                     ApiError::BadRequest("Voucher number already exists".to_string())
@@ -536,7 +595,7 @@ where
 }
 
 /// Computes a canonical SHA-256 request payload hash as a 64-character lowercase hex string.
-pub fn compute_request_hash(req: &CreateVoucherRequest) -> Result<String, serde_json::Error> {
+pub fn compute_request_hash<T: Serialize>(req: &T) -> Result<String, serde_json::Error> {
     let bytes = serde_json::to_vec(req)?;
     let digest = ring::digest::digest(&ring::digest::SHA256, &bytes);
     let mut hash_hex = String::with_capacity(64);

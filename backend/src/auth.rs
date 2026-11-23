@@ -19,6 +19,9 @@ pub enum Role {
     /// Privileged controller role: can void vouchers, close/reopen periods, create backups.
     #[serde(alias = "Controller", alias = "CONTROLLER")]
     Controller,
+    /// Administrative role: superuser access to all accounting and system operations.
+    #[serde(alias = "Admin", alias = "ADMIN")]
+    Admin,
 }
 
 impl std::fmt::Display for Role {
@@ -26,6 +29,7 @@ impl std::fmt::Display for Role {
         match self {
             Role::Accountant => write!(f, "accountant"),
             Role::Controller => write!(f, "controller"),
+            Role::Admin => write!(f, "admin"),
         }
     }
 }
@@ -93,7 +97,7 @@ where
     }
 }
 
-/// Extractor enforcing Controller role privilege on sensitive operations.
+/// Extractor enforcing Controller or Admin role privilege on sensitive operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequireController(pub AuthenticatedUser);
 
@@ -106,12 +110,34 @@ where
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         let user = AuthenticatedUser::from_request_parts(parts, state).await?;
-        if user.claims.role != Role::Controller {
+        if user.claims.role != Role::Controller && user.claims.role != Role::Admin {
             return Err(ApiError::Forbidden(
                 "Access forbidden: Controller role required".to_string(),
             ));
         }
         Ok(RequireController(user))
+    }
+}
+
+/// Extractor enforcing Admin role privilege on administrative and disaster recovery operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequireAdmin(pub AuthenticatedUser);
+
+impl<S> FromRequestParts<S> for RequireAdmin
+where
+    Arc<AppState>: FromRef<S>,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let user = AuthenticatedUser::from_request_parts(parts, state).await?;
+        if user.claims.role != Role::Admin {
+            return Err(ApiError::Forbidden(
+                "Access forbidden: Admin role required".to_string(),
+            ));
+        }
+        Ok(RequireAdmin(user))
     }
 }
 
@@ -153,6 +179,7 @@ mod tests {
     fn test_role_serialization_and_display() {
         assert_eq!(Role::Accountant.to_string(), "accountant");
         assert_eq!(Role::Controller.to_string(), "controller");
+        assert_eq!(Role::Admin.to_string(), "admin");
 
         let acc_json = serde_json::to_string(&Role::Accountant).unwrap();
         assert_eq!(acc_json, "\"accountant\"");
@@ -162,6 +189,15 @@ mod tests {
 
         let de_ctrl: Role = serde_json::from_str("\"controller\"").unwrap();
         assert_eq!(de_ctrl, Role::Controller);
+
+        let de_admin: Role = serde_json::from_str("\"admin\"").unwrap();
+        assert_eq!(de_admin, Role::Admin);
+
+        let de_admin_cap: Role = serde_json::from_str("\"Admin\"").unwrap();
+        assert_eq!(de_admin_cap, Role::Admin);
+
+        let de_admin_upper: Role = serde_json::from_str("\"ADMIN\"").unwrap();
+        assert_eq!(de_admin_upper, Role::Admin);
     }
 
     #[test]

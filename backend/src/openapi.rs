@@ -20,6 +20,7 @@ pub fn generate_openapi_spec() -> Value {
         "tags": [
             { "name": "System", "description": "System health and administrative operations" },
             { "name": "Vouchers", "description": "Double-entry journal voucher lifecycle" },
+            { "name": "Chart of Accounts", "description": "Dynamic Chart of Accounts management per Circular 99/2025/TT-BTC" },
             { "name": "Period Governance", "description": "Monthly accounting period closing and reopening" },
             { "name": "Audit", "description": "Immutable forensic audit trail and regulatory governance" },
             { "name": "Statutory Reports", "description": "Financial statements and trial balance under Circular 99" },
@@ -339,6 +340,97 @@ pub fn generate_openapi_spec() -> Value {
                     }
                 }
             },
+            "/api/v1/accounts": {
+                "get": {
+                    "tags": ["Chart of Accounts"],
+                    "summary": "List Chart of Accounts",
+                    "description": "Lists accounts in the chart of accounts with optional filtering by class or active status.",
+                    "security": [{ "bearerAuth": [] }],
+                    "parameters": [
+                        {
+                            "name": "class",
+                            "in": "query",
+                            "required": false,
+                            "schema": { "$ref": "#/components/schemas/AccountClass" }
+                        },
+                        {
+                            "name": "is_active",
+                            "in": "query",
+                            "required": false,
+                            "schema": { "type": "boolean" }
+                        }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "List of accounts",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "array",
+                                        "items": { "$ref": "#/components/schemas/Account" }
+                                    }
+                                }
+                            }
+                        },
+                        "401": {
+                            "description": "Unauthorized",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        }
+                    }
+                },
+                "post": {
+                    "tags": ["Chart of Accounts"],
+                    "summary": "Create Account",
+                    "description": "Creates a new subaccount in the dynamic chart of accounts. Guarded by RequireController.",
+                    "security": [{ "bearerAuth": [] }],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/CreateAccountRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "201": {
+                            "description": "Account created successfully",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/Account" }
+                                }
+                            }
+                        },
+                        "400": {
+                            "description": "Bad Request - Validation or cycle error",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
+                        "409": {
+                            "description": "Conflict - Duplicate account code",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
+                        "422": {
+                            "description": "Unprocessable Entity - Parent account inactive",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
             "/api/v1/periods": {
                 "get": {
                     "tags": ["Period Governance"],
@@ -502,7 +594,7 @@ pub fn generate_openapi_spec() -> Value {
                 "get": {
                     "tags": ["Audit"],
                     "summary": "Query Audit Trail",
-                    "description": "Retrieves immutable forensic audit trail records with multi-dimensional filtering by actor, action, resource, and date range.",
+                    "description": "Retrieves immutable forensic audit trail records with multi-dimensional filtering by actor, action, resource, and date range. Restricted to Controller or Admin role.",
                     "security": [
                         { "bearerAuth": [] }
                     ],
@@ -529,6 +621,14 @@ pub fn generate_openapi_spec() -> Value {
                         },
                         "401": {
                             "description": "Unauthorized - Missing, malformed, or expired Bearer JWT token",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
+                        "403": {
+                            "description": "Forbidden - Controller or Admin role required",
                             "content": {
                                 "application/json": {
                                     "schema": { "$ref": "#/components/schemas/ErrorResponse" }
@@ -747,6 +847,58 @@ pub fn generate_openapi_spec() -> Value {
                     }
                 }
             },
+            "/api/v1/system/restore": {
+                "post": {
+                    "tags": ["System"],
+                    "summary": "Disaster Recovery Database Restore",
+                    "description": "Restores the accounting database from a validated SQLite snapshot. Requires Admin role and dual-secret confirmation (confirm_overwrite: true, expected_sha256).",
+                    "security": [
+                        { "bearerAuth": [] }
+                    ],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/RestoreRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Database restored successfully",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/RestoreResponse" }
+                                }
+                            }
+                        },
+                        "400": {
+                            "description": "Bad Request - Dual-secret confirmation failure, checksum mismatch, or integrity error",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
+                        "401": {
+                            "description": "Unauthorized - Missing, malformed, or expired Bearer JWT token",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
+                        "403": {
+                            "description": "Forbidden - Admin role required",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
             "/api-docs/openapi.json": {
                 "get": {
                     "tags": ["Documentation"],
@@ -788,10 +940,42 @@ pub fn generate_openapi_spec() -> Value {
                     "type": "http",
                     "scheme": "bearer",
                     "bearerFormat": "JWT",
-                    "description": "JWT Bearer token containing user identity and role (Accountant or Controller)"
+                    "description": "JWT Bearer token containing user identity and role (Accountant, Controller, or Admin)"
                 }
             },
             "schemas": {
+                "AccountClass": {
+                    "type": "string",
+                    "enum": ["ASSET", "LIABILITY", "EQUITY", "REVENUE", "EXPENSE", "CLOSING"]
+                },
+                "NormalBalance": {
+                    "type": "string",
+                    "enum": ["DEBIT", "CREDIT"]
+                },
+                "Account": {
+                    "type": "object",
+                    "required": ["code", "name", "class", "is_active", "normal_balance"],
+                    "properties": {
+                        "code": { "type": "string", "example": "15201" },
+                        "name": { "type": "string", "example": "Thep cuon ma kem Posco 1.2mm" },
+                        "parent_code": { "type": "string", "nullable": true, "example": "1520" },
+                        "class": { "$ref": "#/components/schemas/AccountClass" },
+                        "is_active": { "type": "boolean", "example": true },
+                        "normal_balance": { "$ref": "#/components/schemas/NormalBalance" }
+                    }
+                },
+                "CreateAccountRequest": {
+                    "type": "object",
+                    "required": ["code", "name", "class", "normal_balance"],
+                    "properties": {
+                        "code": { "type": "string", "minLength": 3, "example": "15201" },
+                        "name": { "type": "string", "example": "Thep cuon ma kem Posco 1.2mm" },
+                        "parent_code": { "type": "string", "nullable": true, "example": "1520" },
+                        "class": { "$ref": "#/components/schemas/AccountClass" },
+                        "is_active": { "type": "boolean", "default": true, "example": true },
+                        "normal_balance": { "$ref": "#/components/schemas/NormalBalance" }
+                    }
+                },
                 "CreateVoucherRequest": {
                     "type": "object",
                     "required": ["voucher_no", "voucher_date", "description", "lines"],
@@ -1009,6 +1193,25 @@ pub fn generate_openapi_spec() -> Value {
                         "created_at": { "type": "string", "format": "date-time" }
                     }
                 },
+                "RestoreRequest": {
+                    "type": "object",
+                    "required": ["snapshot_path", "confirm_overwrite", "expected_sha256"],
+                    "properties": {
+                        "snapshot_path": { "type": "string", "example": "./backups/accounting_20260115_120000.db" },
+                        "confirm_overwrite": { "type": "boolean", "example": true },
+                        "expected_sha256": { "type": "string", "example": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" }
+                    }
+                },
+                "RestoreResponse": {
+                    "type": "object",
+                    "required": ["status", "timestamp", "restored_from_snapshot", "sha256_checksum"],
+                    "properties": {
+                        "status": { "type": "string", "example": "RESTORED" },
+                        "timestamp": { "type": "string", "format": "date-time" },
+                        "restored_from_snapshot": { "type": "string", "example": "./backups/accounting_20260115_120000.db" },
+                        "sha256_checksum": { "type": "string", "example": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" }
+                    }
+                },
                 "ErrorResponse": {
                     "type": "object",
                     "required": ["error", "message"],
@@ -1088,6 +1291,7 @@ mod tests {
 
         let paths = spec["paths"].as_object().unwrap();
         assert!(paths.contains_key("/api/v1/system/backup"));
+        assert!(paths.contains_key("/api/v1/system/restore"));
         assert!(paths.contains_key("/api/v1/vouchers"));
         assert!(paths.contains_key("/api-docs/openapi.json"));
         assert!(paths.contains_key("/swagger-ui"));
@@ -1120,6 +1324,11 @@ mod tests {
         assert!(void_post["security"].as_array().is_some());
         assert!(void_post["responses"]["401"].as_object().is_some());
         assert!(void_post["responses"]["403"].as_object().is_some());
+
+        let audit_get = &paths["/api/v1/audit-logs"]["get"];
+        assert!(audit_get["security"].as_array().is_some());
+        assert!(audit_get["responses"]["401"].as_object().is_some());
+        assert!(audit_get["responses"]["403"].as_object().is_some());
 
         // Verify unauthenticated endpoints do not declare security
         assert!(paths["/"]["get"]["security"].is_null());

@@ -1,8 +1,8 @@
 use crate::dto::TrialBalanceRow;
-use crate::ledger::AccountingError;
+use crate::ledger::{AccountValidator, AccountingError};
 use crate::models::{
-    AccountingPeriod, AuditLogEntry, BalanceSheetReport, IdempotencyRecord, IncomeStatementReport,
-    JournalVoucher, VoucherLine, VoucherStatus,
+    Account, AccountClass, AccountingPeriod, AuditLogEntry, BalanceSheetReport, IdempotencyRecord,
+    IncomeStatementReport, JournalVoucher, NormalBalance, VoucherLine, VoucherStatus,
 };
 use chrono::{Datelike, NaiveDate};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -11,6 +11,12 @@ use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
+
+impl From<rusqlite::Error> for AccountingError {
+    fn from(err: rusqlite::Error) -> Self {
+        AccountingError::DatabaseError(err.to_string())
+    }
+}
 
 /// Result outcome of saving a voucher with idempotency tracking.
 #[derive(Debug, Clone, PartialEq)]
@@ -21,6 +27,14 @@ pub enum SaveVoucherOutcome {
     Replayed(JournalVoucher),
 }
 
+/// Minimum required SQLite version number (3.53.0 -> 3_053_000) for WAL-reset resilience.
+pub const MIN_SQLITE_VERSION_NUMBER: i32 = 3_053_000;
+
+/// Asserts that the runtime SQLite engine meets the minimum version requirement (>= 3.53.0).
+pub fn verify_sqlite_engine_version() -> Result<(), AccountingError> {
+    LedgerRepository::verify_sqlite_engine_version()
+}
+
 /// Thread-safe SQLite repository managing audit-grade persistence of vouchers and ledger lines.
 #[derive(Clone)]
 pub struct LedgerRepository {
@@ -28,6 +42,24 @@ pub struct LedgerRepository {
 }
 
 impl LedgerRepository {
+    /// Asserts that the runtime SQLite engine meets the minimum version requirement (>= 3.53.0).
+    pub fn verify_sqlite_engine_version() -> Result<(), AccountingError> {
+        let ver_num = rusqlite::version_number();
+        if ver_num < MIN_SQLITE_VERSION_NUMBER {
+            return Err(AccountingError::DatabaseError(format!(
+                "SQLite engine version {} (code {}) is below required minimum 3.53.0 for WAL-reset resilience",
+                rusqlite::version(),
+                ver_num
+            )));
+        }
+        tracing::info!(
+            sqlite_version = %rusqlite::version(),
+            sqlite_version_number = ver_num,
+            "SQLite engine version verified (>= 3.53.0 WAL-reset resilience standard met)"
+        );
+        Ok(())
+    }
+
     pub fn new(conn: Connection) -> Self {
         Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -37,6 +69,8 @@ impl LedgerRepository {
     /// Initializes the relational double-entry schema in SQLite.
     /// Foreign key constraints, period tracking, and performance indexes are enforced.
     pub fn init_schema(&self) -> Result<(), AccountingError> {
+        Self::verify_sqlite_engine_version()?;
+
         let conn = self.conn.lock().unwrap();
 
         // Configure SQLite pragmas for high concurrency, durability, and foreign key integrity.
@@ -46,6 +80,43 @@ impl LedgerRepository {
              PRAGMA synchronous = NORMAL;
              PRAGMA foreign_keys = ON;",
         )?;
+
+        // 0. Accounts Table (Dynamic Chart of Accounts per Circular 99/2025/TT-BTC)
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS accounts (
+                code TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                parent_code TEXT REFERENCES accounts(code),
+                class TEXT NOT NULL,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                normal_balance TEXT NOT NULL
+            );",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_accounts_parent ON accounts(parent_code);",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_accounts_class ON accounts(class);",
+            [],
+        )?;
+
+        // Seed Statutory Circular 99 Accounts
+        for acct in crate::catalog::STATUTORY_ACCOUNTS {
+            conn.execute(
+                "INSERT OR IGNORE INTO accounts (code, name, parent_code, class, is_active, normal_balance) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6);",
+                params![
+                    acct.code,
+                    acct.name,
+                    acct.parent_code,
+                    acct.class.to_string(),
+                    if acct.is_active { 1 } else { 0 },
+                    acct.normal_balance.to_string(),
+                ],
+            )?;
+        }
 
         // 1. Voucher Header Table (Chứng từ kế toán) with User Attribution and Lifecycle Audit Columns
         conn.execute(
@@ -426,6 +497,30 @@ impl LedgerRepository {
 
         if is_closed {
             return Err(AccountingError::PeriodClosed { year, month });
+        }
+
+        // Validate all leg account codes against accounts table
+        for line in &voucher.lines {
+            let is_active: Option<i32> = tx
+                .query_row(
+                    "SELECT is_active FROM accounts WHERE code = ?1",
+                    params![line.account_code],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            match is_active {
+                None => {
+                    return Err(AccountingError::UnknownAccount {
+                        account_code: line.account_code.clone(),
+                    });
+                }
+                Some(0) => {
+                    return Err(AccountingError::InactiveAccount {
+                        account_code: line.account_code.clone(),
+                    });
+                }
+                Some(_) => {}
+            }
         }
 
         Self::insert_voucher_tx(&tx, voucher)?;
@@ -1496,6 +1591,576 @@ impl LedgerRepository {
 
         Ok(file_size_bytes)
     }
+
+    /// Restores the active database from a point-in-time snapshot.
+    ///
+    /// Pre-validates file existence, computes SHA-256 (asserting expected match if provided),
+    /// executes PRAGMA integrity_check in an isolated read-only connection, and verifies
+    /// required tables (vouchers, voucher_lines, audit_logs).
+    ///
+    /// Uses rollback protection: creates a temporary backup of the live database before restoring.
+    /// If restore fails, the live database is restored from the rollback backup.
+    ///
+    /// On success, checkpoints WAL, enforces foreign keys, and appends a SYSTEM_RESTORE audit log entry.
+    pub fn restore_from_snapshot(
+        &self,
+        snapshot_path: &std::path::Path,
+        expected_sha256: Option<&str>,
+        actor: &str,
+    ) -> Result<RestoreOutcome, AccountingError> {
+        // 1. Snapshot existence and file validation
+        if !snapshot_path.exists() || !snapshot_path.is_file() {
+            return Err(AccountingError::DatabaseError(format!(
+                "Snapshot file does not exist or is not a regular file: {}",
+                snapshot_path.display()
+            )));
+        }
+
+        // 2. Compute SHA-256 checksum using ring
+        let bytes = std::fs::read(snapshot_path).map_err(|e| {
+            AccountingError::DatabaseError(format!(
+                "Failed to read snapshot file '{}': {}",
+                snapshot_path.display(),
+                e
+            ))
+        })?;
+
+        let digest = ring::digest::digest(&ring::digest::SHA256, &bytes);
+        let computed_sha256: String = digest
+            .as_ref()
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect();
+
+        // 3. Expected SHA-256 case-insensitive match (if specified)
+        if let Some(expected) = expected_sha256 {
+            let trimmed = expected.trim();
+            if !trimmed.is_empty() && !computed_sha256.eq_ignore_ascii_case(trimmed) {
+                return Err(AccountingError::DatabaseError(format!(
+                    "Snapshot SHA-256 checksum mismatch: expected '{}', computed '{}'",
+                    trimmed, computed_sha256
+                )));
+            }
+        }
+
+        // 4. Isolated read-only connection for integrity_check and catalog check
+        let snap_conn = Connection::open_with_flags(
+            snapshot_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|e| {
+            AccountingError::DatabaseError(format!(
+                "Failed to open snapshot for pre-validation: {}",
+                e
+            ))
+        })?;
+
+        let integrity_check: Result<String, rusqlite::Error> =
+            snap_conn.query_row("PRAGMA integrity_check;", [], |r| r.get(0));
+        match integrity_check {
+            Ok(ref check) if check == "ok" => {}
+            Ok(other) => {
+                return Err(AccountingError::DatabaseError(format!(
+                    "Snapshot SQLite integrity check failed: {}",
+                    other
+                )));
+            }
+            Err(e) => {
+                return Err(AccountingError::DatabaseError(format!(
+                    "Failed to execute PRAGMA integrity_check on snapshot: {}",
+                    e
+                )));
+            }
+        }
+
+        // 5. Schema verification for essential tables
+        let table_count: i64 = snap_conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('vouchers', 'voucher_lines', 'audit_logs')",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| {
+                AccountingError::DatabaseError(format!(
+                    "Failed to verify schema in snapshot: {}",
+                    e
+                ))
+            })?;
+
+        if table_count < 3 {
+            return Err(AccountingError::DatabaseError(format!(
+                "Snapshot schema is missing required tables (found {} of 3: vouchers, voucher_lines, audit_logs)",
+                table_count
+            )));
+        }
+
+        drop(snap_conn);
+
+        // 6. Active connection restore with rollback protection
+        let mut conn = self.conn.lock().unwrap();
+
+        let temp_rollback = std::env::temp_dir().join(format!("rollback_{}.db", Uuid::new_v4()));
+        conn.backup(
+            rusqlite::MAIN_DB,
+            &temp_rollback,
+            rusqlite::backup::NO_PROGRESS,
+        )
+        .map_err(|e| {
+            AccountingError::DatabaseError(format!(
+                "Failed to create rollback checkpoint before restore: {}",
+                e
+            ))
+        })?;
+
+        if let Err(restore_err) = conn.restore(
+            rusqlite::MAIN_DB,
+            snapshot_path,
+            rusqlite::backup::NO_PROGRESS,
+        ) {
+            // Roll back to the original database state
+            let _ = conn.restore(
+                rusqlite::MAIN_DB,
+                &temp_rollback,
+                rusqlite::backup::NO_PROGRESS,
+            );
+            let _ = std::fs::remove_file(&temp_rollback);
+            return Err(AccountingError::DatabaseError(format!(
+                "Database restore failed, rolled back to original state: {}",
+                restore_err
+            )));
+        }
+
+        // Clean up rollback checkpoint file upon successful restore
+        let _ = std::fs::remove_file(&temp_rollback);
+
+        // 7. Post-restore pragmas and audit trail logging
+        let _ = conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             PRAGMA wal_checkpoint(TRUNCATE);",
+        );
+
+        let timestamp = chrono::Utc::now().to_rfc3339();
+        let snapshot_path_str = snapshot_path.to_string_lossy().to_string();
+        let details = format!(
+            "Restored database from snapshot '{}' (SHA-256: {})",
+            snapshot_path_str, computed_sha256
+        );
+
+        let _ = conn.execute(
+            "INSERT INTO audit_logs (id, timestamp, actor, action, resource_type, resource_id, details, client_ip)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                Uuid::new_v4().to_string(),
+                timestamp,
+                actor,
+                "SYSTEM_RESTORE",
+                "SYSTEM",
+                snapshot_path_str,
+                details,
+                Option::<String>::None,
+            ],
+        );
+
+        Ok(RestoreOutcome {
+            restored_from_snapshot: snapshot_path_str,
+            sha256_checksum: computed_sha256,
+            timestamp,
+        })
+    }
+
+    /// Lists accounts from the chart of accounts, optionally filtered by class or active status.
+    pub fn list_accounts(
+        &self,
+        class: Option<AccountClass>,
+        is_active: Option<bool>,
+    ) -> Result<Vec<Account>, AccountingError> {
+        let conn = self.conn.lock().unwrap();
+        let mut sql = "SELECT code, name, parent_code, class, is_active, normal_balance FROM accounts WHERE 1=1".to_string();
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+        if let Some(c) = class {
+            sql.push_str(" AND class = ?");
+            params_vec.push(Box::new(c.to_string()));
+        }
+        if let Some(a) = is_active {
+            sql.push_str(" AND is_active = ?");
+            params_vec.push(Box::new(if a { 1 } else { 0 }));
+        }
+        sql.push_str(" ORDER BY code ASC");
+
+        let params_slice: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|b| &**b).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_slice.as_slice(), |r| {
+            let class_str: String = r.get(3)?;
+            let normal_str: String = r.get(5)?;
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                class_str,
+                r.get::<_, i32>(4)? != 0,
+                normal_str,
+            ))
+        })?;
+
+        let mut accounts = Vec::new();
+        for r in rows {
+            let (code, name, parent_code, class_str, is_active, normal_str) = r?;
+            let class = class_str.parse().unwrap_or(AccountClass::Asset);
+            let normal_balance = normal_str.parse().unwrap_or(NormalBalance::Debit);
+            accounts.push(Account {
+                code,
+                name,
+                parent_code,
+                class,
+                is_active,
+                normal_balance,
+            });
+        }
+        Ok(accounts)
+    }
+
+    /// Retrieves an account by its code.
+    pub fn get_account(&self, code: &str) -> Result<Option<Account>, AccountingError> {
+        let conn = self.conn.lock().unwrap();
+        let row: Option<(String, String, Option<String>, String, i32, String)> = conn
+            .query_row(
+                "SELECT code, name, parent_code, class, is_active, normal_balance FROM accounts WHERE code = ?1",
+                params![code],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            )
+            .optional()?;
+
+        match row {
+            Some((code, name, parent_code, class_str, is_active, normal_str)) => {
+                let class = class_str.parse().unwrap_or(AccountClass::Asset);
+                let normal_balance = normal_str.parse().unwrap_or(NormalBalance::Debit);
+                Ok(Some(Account {
+                    code,
+                    name,
+                    parent_code,
+                    class,
+                    is_active: is_active != 0,
+                    normal_balance,
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Creates a new account in the chart of accounts with duplicate, parent, and cycle validation.
+    /// Also records an immutable CREATE_ACCOUNT audit trail event atomically.
+    pub fn create_account(
+        &self,
+        account: &Account,
+        actor: &str,
+        idempotency: Option<(&str, &str, &str, &str)>,
+    ) -> Result<Account, AccountingError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        // 1. Check duplicate code (409 Conflict)
+        let exists: i64 = tx.query_row(
+            "SELECT count(*) FROM accounts WHERE code = ?1",
+            params![account.code],
+            |r| r.get(0),
+        )?;
+        if exists > 0 {
+            return Err(AccountingError::DuplicateAccount(format!(
+                "Account code {} already exists",
+                account.code
+            )));
+        }
+
+        // 2. Validate parent if present
+        if let Some(ref parent) = account.parent_code {
+            if parent == &account.code {
+                return Err(AccountingError::CircularAccountReference(format!(
+                    "Self-referential account parent: {}",
+                    account.code
+                )));
+            }
+            let parent_row: Option<(i32, Option<String>)> = tx
+                .query_row(
+                    "SELECT is_active, parent_code FROM accounts WHERE code = ?1",
+                    params![parent],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+
+            match parent_row {
+                None => {
+                    return Err(AccountingError::ParentAccountNotFound(format!(
+                        "Parent account {} does not exist",
+                        parent
+                    )));
+                }
+                Some((0, _)) => {
+                    return Err(AccountingError::ParentAccountInactive(format!(
+                        "Parent account {} is inactive",
+                        parent
+                    )));
+                }
+                Some((_, next_parent)) => {
+                    // Walk ancestor chain to detect cycle
+                    let mut curr_parent = next_parent;
+                    let mut visited = std::collections::HashSet::new();
+                    visited.insert(parent.clone());
+                    while let Some(ancestor) = curr_parent {
+                        if ancestor == account.code {
+                            return Err(AccountingError::CircularAccountReference(format!(
+                                "Circular reference detected between {} and {}",
+                                account.code, ancestor
+                            )));
+                        }
+                        if !visited.insert(ancestor.clone()) {
+                            break;
+                        }
+                        let anc_parent: Option<Option<String>> = tx
+                            .query_row(
+                                "SELECT parent_code FROM accounts WHERE code = ?1",
+                                params![ancestor],
+                                |r| r.get(0),
+                            )
+                            .optional()?;
+                        curr_parent = anc_parent.flatten();
+                    }
+                }
+            }
+        }
+
+        // 3. Insert into accounts
+        tx.execute(
+            "INSERT INTO accounts (code, name, parent_code, class, is_active, normal_balance) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                account.code,
+                account.name,
+                account.parent_code,
+                account.class.to_string(),
+                if account.is_active { 1 } else { 0 },
+                account.normal_balance.to_string(),
+            ],
+        )?;
+
+        // 4. Audit log entry
+        let audit_payload = serde_json::to_string(account).unwrap_or_default();
+        tx.execute(
+            "INSERT INTO audit_logs (id, timestamp, actor, action, resource_type, resource_id, details) \
+             VALUES (?1, ?2, ?3, 'CREATE_ACCOUNT', 'ACCOUNT', ?4, ?5)",
+            params![
+                Uuid::new_v4().to_string(),
+                chrono::Utc::now().to_rfc3339(),
+                actor,
+                account.code,
+                audit_payload,
+            ],
+        )?;
+
+        // 5. Idempotency record if key provided
+        if let Some((key, actor_key, endpoint, request_hash)) = idempotency {
+            let response_body = serde_json::to_string(account).map_err(|e| {
+                AccountingError::DatabaseError(format!("Failed to serialize account response: {e}"))
+            })?;
+            let now = chrono::Utc::now().to_rfc3339();
+            tx.execute(
+                "INSERT INTO idempotency_records (key, actor, endpoint, request_hash, status_code, response_body, resource_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    key,
+                    actor_key,
+                    endpoint,
+                    request_hash,
+                    201i64,
+                    response_body,
+                    account.code,
+                    now,
+                ],
+            )?;
+        }
+
+        tx.commit()?;
+        Ok(account.clone())
+    }
+}
+
+impl AccountValidator for LedgerRepository {
+    fn validate_account(&self, code: &str) -> Result<(), AccountingError> {
+        let conn = self.conn.lock().unwrap();
+        let row: Option<i32> = conn
+            .query_row(
+                "SELECT is_active FROM accounts WHERE code = ?1",
+                params![code],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match row {
+            None => Err(AccountingError::UnknownAccount {
+                account_code: code.to_string(),
+            }),
+            Some(0) => Err(AccountingError::InactiveAccount {
+                account_code: code.to_string(),
+            }),
+            Some(_) => Ok(()),
+        }
+    }
+}
+
+/// Result outcome metadata from a successfully executed database restore operation.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RestoreOutcome {
+    /// Absolute or relative path of the snapshot file restored.
+    pub restored_from_snapshot: String,
+    /// Computed hex-encoded SHA-256 checksum of the restored snapshot file.
+    pub sha256_checksum: String,
+    /// RFC-3339 UTC timestamp when the restore operation committed.
+    pub timestamp: String,
+}
+
+/// Public helper function to execute an offline / CLI database restore from `snapshot` into `target`.
+/// Ensures target directory exists, validates snapshot integrity and schema, and restores into target.
+pub fn execute_cli_restore(
+    snapshot: &std::path::Path,
+    target: &std::path::Path,
+    actor: &str,
+) -> Result<RestoreOutcome, AccountingError> {
+    if !snapshot.exists() || !snapshot.is_file() {
+        return Err(AccountingError::DatabaseError(format!(
+            "Snapshot file does not exist: {}",
+            snapshot.display()
+        )));
+    }
+
+    // Compute and verify snapshot SHA-256
+    let bytes = std::fs::read(snapshot).map_err(|e| {
+        AccountingError::DatabaseError(format!(
+            "Failed to read snapshot file '{}': {}",
+            snapshot.display(),
+            e
+        ))
+    })?;
+
+    let digest = ring::digest::digest(&ring::digest::SHA256, &bytes);
+    let computed_sha256: String = digest
+        .as_ref()
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect();
+
+    // Verify snapshot integrity and schema
+    let snap_conn = Connection::open_with_flags(
+        snapshot,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| {
+        AccountingError::DatabaseError(format!("Failed to open snapshot for pre-validation: {}", e))
+    })?;
+
+    let integrity_check: Result<String, rusqlite::Error> =
+        snap_conn.query_row("PRAGMA integrity_check;", [], |r| r.get(0));
+    match integrity_check {
+        Ok(ref check) if check == "ok" => {}
+        Ok(other) => {
+            return Err(AccountingError::DatabaseError(format!(
+                "Snapshot SQLite integrity check failed: {}",
+                other
+            )));
+        }
+        Err(e) => {
+            return Err(AccountingError::DatabaseError(format!(
+                "Failed to execute PRAGMA integrity_check on snapshot: {}",
+                e
+            )));
+        }
+    }
+
+    let table_count: i64 = snap_conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('vouchers', 'voucher_lines', 'audit_logs')",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|e| {
+            AccountingError::DatabaseError(format!(
+                "Failed to verify schema in snapshot: {}",
+                e
+            ))
+        })?;
+
+    if table_count < 3 {
+        return Err(AccountingError::DatabaseError(format!(
+            "Snapshot schema is missing required tables (found {} of 3: vouchers, voucher_lines, audit_logs)",
+            table_count
+        )));
+    }
+    drop(snap_conn);
+
+    if let Some(parent) = target.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            AccountingError::DatabaseError(format!("Failed to create target directory: {}", e))
+        })?;
+    }
+
+    // Restore to target file via direct copy, ensuring zero-byte discrepancy
+    std::fs::copy(snapshot, target).map_err(|e| {
+        AccountingError::DatabaseError(format!(
+            "Failed to copy snapshot to target '{}': {}",
+            target.display(),
+            e
+        ))
+    })?;
+
+    // Verify restored target database is valid SQLite
+    let target_conn = Connection::open_with_flags(
+        target,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| {
+        AccountingError::DatabaseError(format!("Failed to open restored target database: {}", e))
+    })?;
+    let target_check: String = target_conn
+        .query_row("PRAGMA integrity_check;", [], |r| r.get(0))
+        .map_err(|e| {
+            AccountingError::DatabaseError(format!(
+                "Failed to verify integrity of restored target database: {}",
+                e
+            ))
+        })?;
+    if target_check != "ok" {
+        return Err(AccountingError::DatabaseError(format!(
+            "Restored target database integrity check failed: {}",
+            target_check
+        )));
+    }
+
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let snapshot_path_str = snapshot.to_string_lossy().to_string();
+    let details = format!(
+        "Restored database from snapshot '{}' (SHA-256: {}) via CLI",
+        snapshot_path_str, computed_sha256
+    );
+
+    let _ = target_conn.execute(
+        "INSERT INTO audit_logs (id, timestamp, actor, action, resource_type, resource_id, details, client_ip)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            uuid::Uuid::new_v4().to_string(),
+            timestamp,
+            actor,
+            "SYSTEM_RESTORE",
+            "SYSTEM",
+            snapshot_path_str,
+            details,
+            Option::<String>::None,
+        ],
+    );
+    drop(target_conn);
+
+    Ok(RestoreOutcome {
+        restored_from_snapshot: snapshot_path_str,
+        sha256_checksum: computed_sha256,
+        timestamp,
+    })
 }
 
 #[cfg(test)]
@@ -1507,6 +2172,19 @@ mod tests {
     use rusqlite::Connection;
     use rust_decimal_macros::dec;
     use uuid::Uuid;
+
+    #[test]
+    fn test_sqlite_engine_version_wal_resilience() {
+        assert!(
+            rusqlite::version_number() >= MIN_SQLITE_VERSION_NUMBER,
+            "SQLite engine version {} ({}) must be >= 3.53.0 ({})",
+            rusqlite::version(),
+            rusqlite::version_number(),
+            MIN_SQLITE_VERSION_NUMBER
+        );
+        assert!(LedgerRepository::verify_sqlite_engine_version().is_ok());
+        assert!(verify_sqlite_engine_version().is_ok());
+    }
 
     #[test]
     fn test_init_and_save_compound_voucher() {
@@ -2443,5 +3121,149 @@ mod tests {
         // Ensure no voucher in DB
         let vouchers = repo.list_vouchers(None, None).unwrap();
         assert!(vouchers.is_empty());
+    }
+
+    #[test]
+    fn test_restore_from_snapshot_lifecycle_and_rollback() {
+        let temp_dir = std::env::temp_dir().join(format!("test_restore_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let snap_file = temp_dir.join("test_snap.db");
+
+        let conn = Connection::open_in_memory().unwrap();
+        let repo = LedgerRepository::new(conn);
+        repo.init_schema().unwrap();
+
+        // 1. Post a baseline voucher
+        let v1_id = Uuid::new_v4();
+        let voucher1 = JournalVoucher {
+            id: v1_id,
+            voucher_no: "PKT-SNAP-01".to_string(),
+            voucher_date: NaiveDate::from_ymd_opt(2026, 1, 10).unwrap(),
+            description: "Baseline voucher before snapshot".to_string(),
+            invoice_ref: None,
+            status: VoucherStatus::Posted,
+            created_by: "accountant_lan".to_string(),
+            approved_by: None,
+            voided_at: None,
+            voided_by: None,
+            void_reason: None,
+            created_at: "2026-01-10T00:00:00Z".to_string(),
+            lines: vec![
+                VoucherLine {
+                    id: Uuid::new_v4(),
+                    line_no: 1,
+                    account_code: "1111".to_string(),
+                    debit: Decimal::from(5000),
+                    credit: Decimal::ZERO,
+                    line_desc: None,
+                },
+                VoucherLine {
+                    id: Uuid::new_v4(),
+                    line_no: 2,
+                    account_code: "1121".to_string(),
+                    debit: Decimal::ZERO,
+                    credit: Decimal::from(5000),
+                    line_desc: None,
+                },
+            ],
+        };
+        repo.save_voucher(&voucher1).unwrap();
+
+        // 2. Create backup snapshot
+        let snap_str = snap_file.to_string_lossy().to_string();
+        repo.create_backup(&snap_str, "admin").unwrap();
+        assert!(snap_file.exists());
+
+        // 3. Post a second voucher post-backup (rogue data)
+        let v2_id = Uuid::new_v4();
+        let voucher2 = JournalVoucher {
+            id: v2_id,
+            voucher_no: "PKT-ROGUE-02".to_string(),
+            voucher_date: NaiveDate::from_ymd_opt(2026, 1, 15).unwrap(),
+            description: "Rogue voucher after snapshot".to_string(),
+            invoice_ref: None,
+            status: VoucherStatus::Posted,
+            created_by: "rogue_actor".to_string(),
+            approved_by: None,
+            voided_at: None,
+            voided_by: None,
+            void_reason: None,
+            created_at: "2026-01-15T00:00:00Z".to_string(),
+            lines: vec![
+                VoucherLine {
+                    id: Uuid::new_v4(),
+                    line_no: 1,
+                    account_code: "1111".to_string(),
+                    debit: Decimal::from(1000),
+                    credit: Decimal::ZERO,
+                    line_desc: None,
+                },
+                VoucherLine {
+                    id: Uuid::new_v4(),
+                    line_no: 2,
+                    account_code: "1121".to_string(),
+                    debit: Decimal::ZERO,
+                    credit: Decimal::from(1000),
+                    line_desc: None,
+                },
+            ],
+        };
+        repo.save_voucher(&voucher2).unwrap();
+        assert_eq!(repo.list_vouchers(None, None).unwrap().len(), 2);
+
+        // 4. Test SHA-256 mismatch rejection (leaves active database intact)
+        let err_hash = repo
+            .restore_from_snapshot(
+                &snap_file,
+                Some("0000000000000000000000000000000000000000000000000000000000000000"),
+                "admin",
+            )
+            .unwrap_err();
+        assert!(err_hash.to_string().contains("checksum mismatch"));
+        assert_eq!(repo.list_vouchers(None, None).unwrap().len(), 2);
+
+        // 5. Test successful restore from snapshot
+        let outcome = repo
+            .restore_from_snapshot(&snap_file, None, "system_admin")
+            .unwrap();
+        assert_eq!(outcome.sha256_checksum.len(), 64);
+        assert_eq!(outcome.restored_from_snapshot, snap_str);
+
+        // Verify state is restored: voucher 2 is gone, voucher 1 is present
+        let restored_vouchers = repo.list_vouchers(None, None).unwrap();
+        assert_eq!(restored_vouchers.len(), 1);
+        assert_eq!(restored_vouchers[0].voucher_no, "PKT-SNAP-01");
+
+        // Verify audit log has SYSTEM_RESTORE
+        let logs = repo
+            .list_audit_logs(&crate::dto::AuditLogQuery::default())
+            .unwrap();
+        let has_restore_log = logs
+            .iter()
+            .any(|l| l.action == "SYSTEM_RESTORE" && l.actor == "system_admin");
+        assert!(has_restore_log, "SYSTEM_RESTORE audit log must be recorded");
+
+        // 6. Test execute_cli_restore
+        let target_file = temp_dir.join("cli_target.db");
+        let cli_outcome = execute_cli_restore(&snap_file, &target_file, "cli_admin").unwrap();
+        assert_eq!(cli_outcome.sha256_checksum, outcome.sha256_checksum);
+        assert!(target_file.exists());
+        // Verify audit log in cli_target.db
+        let target_conn = Connection::open(&target_file).unwrap();
+        let target_actor: String = target_conn
+            .query_row(
+                "SELECT actor FROM audit_logs WHERE action = 'SYSTEM_RESTORE' ORDER BY id DESC LIMIT 1;",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(target_actor, "cli_admin");
+
+        let target_vouchers_count: i64 = target_conn
+            .query_row("SELECT count(*) FROM vouchers;", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(target_vouchers_count, 1);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

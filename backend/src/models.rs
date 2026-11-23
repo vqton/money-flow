@@ -300,3 +300,94 @@ pub struct IdempotencyRecord {
     pub resource_id: Option<String>,
     pub created_at: String,
 }
+
+/// Account classification according to Vietnamese Accounting Standards (Circular 99/2025/TT-BTC).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AccountClass {
+    Asset,
+    Liability,
+    Equity,
+    Revenue,
+    Expense,
+    Closing,
+}
+
+impl std::fmt::Display for AccountClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Asset => write!(f, "ASSET"),
+            Self::Liability => write!(f, "LIABILITY"),
+            Self::Equity => write!(f, "EQUITY"),
+            Self::Revenue => write!(f, "REVENUE"),
+            Self::Expense => write!(f, "EXPENSE"),
+            Self::Closing => write!(f, "CLOSING"),
+        }
+    }
+}
+
+impl std::str::FromStr for AccountClass {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let trimmed = s.trim();
+        if trimmed.eq_ignore_ascii_case("ASSET") {
+            Ok(Self::Asset)
+        } else if trimmed.eq_ignore_ascii_case("LIABILITY") {
+            Ok(Self::Liability)
+        } else if trimmed.eq_ignore_ascii_case("EQUITY") {
+            Ok(Self::Equity)
+        } else if trimmed.eq_ignore_ascii_case("REVENUE") {
+            Ok(Self::Revenue)
+        } else if trimmed.eq_ignore_ascii_case("EXPENSE") {
+            Ok(Self::Expense)
+        } else if trimmed.eq_ignore_ascii_case("CLOSING") {
+            Ok(Self::Closing)
+        } else {
+            Err(format!("Unknown account class: {s}"))
+        }
+    }
+}
+
+/// Normal balance rule for double-entry accounts (Debit or Credit).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum NormalBalance {
+    Debit,
+    Credit,
+}
+
+impl std::fmt::Display for NormalBalance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Debit => write!(f, "DEBIT"),
+            Self::Credit => write!(f, "CREDIT"),
+        }
+    }
+}
+
+impl std::str::FromStr for NormalBalance {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let trimmed = s.trim();
+        if trimmed.eq_ignore_ascii_case("DEBIT") {
+            Ok(Self::Debit)
+        } else if trimmed.eq_ignore_ascii_case("CREDIT") {
+            Ok(Self::Credit)
+        } else {
+            Err(format!("Unknown normal balance: {s}"))
+        }
+    }
+}
+
+/// Account entity representing a node in the dynamic chart of accounts.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Account {
+    pub code: String,
+    pub name: String,
+    pub parent_code: Option<String>,
+    pub class: AccountClass,
+    pub is_active: bool,
+    pub normal_balance: NormalBalance,
+}

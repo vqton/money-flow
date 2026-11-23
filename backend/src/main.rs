@@ -7,10 +7,90 @@ use backend::state::AppState;
 use rusqlite::Connection;
 use std::sync::Arc;
 
+/// Parses arguments and executes the disaster recovery CLI restore subcommand.
+fn run_cli_restore(args: &[String]) -> Result<(), i32> {
+    let mut snapshot: Option<String> = None;
+    let mut target: Option<String> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--snapshot" => {
+                i += 1;
+                if i < args.len() {
+                    snapshot = Some(args[i].clone());
+                } else {
+                    eprintln!("Error: Missing value for --snapshot");
+                    return Err(1);
+                }
+            }
+            "--target" => {
+                i += 1;
+                if i < args.len() {
+                    target = Some(args[i].clone());
+                } else {
+                    eprintln!("Error: Missing value for --target");
+                    return Err(1);
+                }
+            }
+            unknown => {
+                eprintln!("Error: Unrecognized flag '{unknown}'");
+                return Err(1);
+            }
+        }
+        i += 1;
+    }
+
+    let snapshot_path = match snapshot {
+        Some(s) if !s.trim().is_empty() => s,
+        _ => {
+            eprintln!("Error: Missing required argument --snapshot <path>");
+            return Err(1);
+        }
+    };
+
+    let target_path = match target {
+        Some(t) if !t.trim().is_empty() => t,
+        _ => {
+            eprintln!("Error: Missing required argument --target <database_path>");
+            return Err(1);
+        }
+    };
+
+    match backend::database::execute_cli_restore(
+        std::path::Path::new(&snapshot_path),
+        std::path::Path::new(&target_path),
+        "cli_admin",
+    ) {
+        Ok(outcome) => {
+            println!(
+                "Successfully restored database from '{}' to '{}' (SHA-256: {}) at {}",
+                outcome.restored_from_snapshot,
+                target_path,
+                outcome.sha256_checksum,
+                outcome.timestamp
+            );
+            Ok(())
+        }
+        Err(err) => {
+            eprintln!("Restore error: {err}");
+            Err(1)
+        }
+    }
+}
+
 /// Entry point for the accounting backend service.
 /// Loads 12-factor configuration, initializes early tracing, sets up the SQLite database, and runs the Axum HTTP server.
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Check for CLI subcommands before starting the HTTP service
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 && args[1] == "restore" {
+        if let Err(code) = run_cli_restore(&args[2..]) {
+            std::process::exit(code);
+        }
+        return Ok(());
+    }
     // 0. Resolve log directory and install panic hook early
     let dotenv = AppConfig::read_dotenv_map();
     let log_dir = std::env::var("LOG_DIR")
@@ -82,6 +162,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                          backend.exe\n\n  \
                      * Or specify in your .env file:\n      \
                          LOG_FORMAT=pretty"
+                        .to_string(),
+                ),
+                backend::config::ConfigError::InvalidFiscalYearStartMonth(val) => (
+                    format!(
+                        "The configured FISCAL_YEAR_START_MONTH value '{val}' is invalid.\n  \
+                         Fiscal year start month must be an integer between 1 and 12 per Circular 99 Điều 31."
+                    ),
+                    "Set a valid fiscal year start month (1-12) before starting backend.exe:\n\n  \
+                     * PowerShell:\n      \
+                         $env:FISCAL_YEAR_START_MONTH = \"1\"\n      \
+                         .\\backend.exe\n\n  \
+                     * Windows Command Prompt (CMD):\n      \
+                         set FISCAL_YEAR_START_MONTH=1\n      \
+                         backend.exe\n\n  \
+                     * Or specify in your .env file:\n      \
+                         FISCAL_YEAR_START_MONTH=1"
                         .to_string(),
                 ),
                 backend::config::ConfigError::MissingVar(var) => (

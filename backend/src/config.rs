@@ -10,6 +10,9 @@ pub enum ConfigError {
     /// An invalid log format was supplied.
     #[error("Invalid log format '{0}': expected 'pretty' or 'compact'")]
     InvalidLogFormat(String),
+    /// An invalid fiscal year start month was supplied.
+    #[error("Invalid fiscal year start month '{0}': expected an integer between 1 and 12")]
+    InvalidFiscalYearStartMonth(String),
 }
 
 /// Console logging output format style.
@@ -67,6 +70,8 @@ pub struct AppConfig {
     pub log_format: LogFormat,
     /// Secret key used for signing and verifying Bearer JWT tokens (env: JWT_SECRET).
     pub jwt_secret: String,
+    /// Fiscal year start month (1..=12, env: FISCAL_YEAR_START_MONTH, default: 1).
+    pub fiscal_year_start_month: u8,
 }
 
 impl Default for AppConfig {
@@ -80,6 +85,7 @@ impl Default for AppConfig {
             log_dir: "./logs".to_string(),
             log_format: LogFormat::Pretty,
             jwt_secret: DEFAULT_TEST_JWT_SECRET.to_string(),
+            fiscal_year_start_month: 1,
         }
     }
 }
@@ -185,6 +191,20 @@ impl AppConfig {
             _ => default.log_format,
         };
 
+        let fiscal_year_start_month = match getter("FISCAL_YEAR_START_MONTH") {
+            Some(s) if !s.trim().is_empty() => {
+                let trimmed = s.trim();
+                let month: u8 = trimmed
+                    .parse()
+                    .map_err(|_| ConfigError::InvalidFiscalYearStartMonth(s.to_string()))?;
+                if !(1..=12).contains(&month) {
+                    return Err(ConfigError::InvalidFiscalYearStartMonth(s.to_string()));
+                }
+                month
+            }
+            _ => default.fiscal_year_start_month,
+        };
+
         let jwt_secret = match getter("JWT_SECRET") {
             Some(secret) if !secret.trim().is_empty() => secret,
             _ => return Err(ConfigError::MissingVar("JWT_SECRET".to_string())),
@@ -199,6 +219,7 @@ impl AppConfig {
             log_dir,
             log_format,
             jwt_secret,
+            fiscal_year_start_month,
         })
     }
 
@@ -231,6 +252,19 @@ impl AppConfig {
             Some(s) if !s.trim().is_empty() => LogFormat::parse(&s)?,
             _ => default.log_format,
         };
+        let fiscal_year_start_month = match getter("FISCAL_YEAR_START_MONTH") {
+            Some(s) if !s.trim().is_empty() => {
+                let trimmed = s.trim();
+                let month: u8 = trimmed
+                    .parse()
+                    .map_err(|_| ConfigError::InvalidFiscalYearStartMonth(s.to_string()))?;
+                if !(1..=12).contains(&month) {
+                    return Err(ConfigError::InvalidFiscalYearStartMonth(s.to_string()));
+                }
+                month
+            }
+            _ => default.fiscal_year_start_month,
+        };
         let jwt_secret = getter("JWT_SECRET")
             .filter(|s| !s.trim().is_empty())
             .unwrap_or(default.jwt_secret);
@@ -244,6 +278,7 @@ impl AppConfig {
             log_dir,
             log_format,
             jwt_secret,
+            fiscal_year_start_month,
         })
     }
 }
@@ -401,5 +436,55 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!(err, ConfigError::InvalidLogFormat("json".to_string()));
+    }
+
+    #[test]
+    fn test_fiscal_year_start_month_default() {
+        let config = AppConfig::default();
+        assert_eq!(config.fiscal_year_start_month, 1);
+    }
+
+    #[test]
+    fn test_fiscal_year_start_month_valid() {
+        let config = AppConfig::from_env_with_fallback(|k| match k {
+            "FISCAL_YEAR_START_MONTH" => Some(" 4 ".to_string()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(config.fiscal_year_start_month, 4);
+
+        let strict = AppConfig::from_env_strict(|k| match k {
+            "JWT_SECRET" => Some("production-secret-32-bytes-long!!!".to_string()),
+            "FISCAL_YEAR_START_MONTH" => Some("12".to_string()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(strict.fiscal_year_start_month, 12);
+    }
+
+    #[test]
+    fn test_fiscal_year_start_month_invalid() {
+        for invalid in ["0", "13", "abc", "-1"] {
+            let err = AppConfig::from_env_strict(|k| match k {
+                "JWT_SECRET" => Some("production-secret-32-bytes-long!!!".to_string()),
+                "FISCAL_YEAR_START_MONTH" => Some(invalid.to_string()),
+                _ => None,
+            })
+            .unwrap_err();
+            assert_eq!(
+                err,
+                ConfigError::InvalidFiscalYearStartMonth(invalid.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn test_fiscal_year_start_month_empty_fallback() {
+        let config = AppConfig::from_env_with_fallback(|k| match k {
+            "FISCAL_YEAR_START_MONTH" => Some("   ".to_string()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(config.fiscal_year_start_month, 1);
     }
 }

@@ -3,6 +3,12 @@ target/
 backend/target/
 _verify/
 
+# Application runtime logs and backups
+logs/
+backend/logs/
+backups/
+backend/backups/
+
 # AI Agent metadata & indexing
 /.agents
 /.codegraph

@@ -56,13 +56,55 @@ pub enum AccountingError {
     #[error("Idempotency key '{key}' already exists with a different request payload")]
     IdempotencyConflict { key: String },
 
+    #[error("Account {account_code} does not exist in chart of accounts")]
+    UnknownAccount { account_code: String },
+
+    #[error("Account {account_code} is inactive")]
+    InactiveAccount { account_code: String },
+
+    #[error("Duplicate account code: {0}")]
+    DuplicateAccount(String),
+
+    #[error("Account parent not found: {0}")]
+    ParentAccountNotFound(String),
+
+    #[error("Parent account is inactive: {0}")]
+    ParentAccountInactive(String),
+
+    #[error("Circular account reference: {0}")]
+    CircularAccountReference(String),
+
     #[error("Database error: {0}")]
     DatabaseError(String),
 }
 
-impl From<rusqlite::Error> for AccountingError {
-    fn from(err: rusqlite::Error) -> Self {
-        AccountingError::DatabaseError(err.to_string())
+/// Trait for validating existence and active status of account codes.
+pub trait AccountValidator {
+    /// Validates an account code, returning Ok(()) if valid and active.
+    fn validate_account(&self, code: &str) -> Result<(), AccountingError>;
+}
+
+/// Static catalog validator checking against the 103 statutory Circular 99 accounts without I/O.
+pub struct StatutoryAccountCatalog;
+
+impl AccountValidator for StatutoryAccountCatalog {
+    fn validate_account(&self, code: &str) -> Result<(), AccountingError> {
+        if let Some(acct) = crate::catalog::STATUTORY_ACCOUNTS
+            .iter()
+            .find(|a| a.code == code)
+        {
+            if acct.is_active {
+                Ok(())
+            } else {
+                Err(AccountingError::InactiveAccount {
+                    account_code: code.to_string(),
+                })
+            }
+        } else {
+            Err(AccountingError::UnknownAccount {
+                account_code: code.to_string(),
+            })
+        }
     }
 }
 
@@ -82,7 +124,31 @@ impl LedgerEngine {
     /// 3. A line cannot have both Debit > 0 and Credit > 0 simultaneously.
     /// 4. Every line must have either Debit > 0 or Credit > 0 (no empty zero lines).
     /// 5. Golden Rule: Total Debits == Total Credits > 0.
+    /// 6. Validates account codes against the static Circular 99 statutory catalog.
     pub fn validate_voucher(&self, voucher: &JournalVoucher) -> Result<(), AccountingError> {
+        self.validate_voucher_with_validator(voucher, &StatutoryAccountCatalog)
+    }
+
+    /// Validates double-entry structural rules and checks accounts against a provided validator.
+    pub fn validate_voucher_with_validator(
+        &self,
+        voucher: &JournalVoucher,
+        validator: &dyn AccountValidator,
+    ) -> Result<(), AccountingError> {
+        self.validate_structure(voucher)?;
+        for line in &voucher.lines {
+            validator.validate_account(&line.account_code)?;
+        }
+        Ok(())
+    }
+
+    /// Validates that a journal voucher satisfies double-entry mathematical invariants:
+    /// 1. Contains at least two line items.
+    /// 2. All amounts are strictly non-negative (>= 0).
+    /// 3. A line cannot have both Debit > 0 and Credit > 0 simultaneously.
+    /// 4. Every line must have either Debit > 0 or Credit > 0 (no empty zero lines).
+    /// 5. Golden Rule: Total Debits == Total Credits > 0.
+    pub fn validate_structure(&self, voucher: &JournalVoucher) -> Result<(), AccountingError> {
         if voucher.lines.len() < 2 {
             return Err(AccountingError::EmptyOrSingleLineVoucher);
         }

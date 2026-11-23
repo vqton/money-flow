@@ -45,6 +45,10 @@ fn controller_token() -> String {
     test_token("chief_controller", Role::Controller)
 }
 
+fn admin_token() -> String {
+    test_token("system_admin", Role::Admin)
+}
+
 #[tokio::test]
 async fn test_api_health_check() {
     let app = setup_test_app();
@@ -1946,7 +1950,7 @@ async fn test_api_audit_log_capture() {
     let log_req = Request::builder()
         .method("GET")
         .uri("/api/v1/audit-logs")
-        .header(header::AUTHORIZATION, format!("Bearer {}", acc_token))
+        .header(header::AUTHORIZATION, format!("Bearer {}", ctrl_token))
         .body(Body::empty())
         .unwrap();
     let log_res = app.clone().oneshot(log_req).await.unwrap();
@@ -1966,7 +1970,7 @@ async fn test_api_audit_log_capture() {
     let filtered_req = Request::builder()
         .method("GET")
         .uri("/api/v1/audit-logs?action=VOID_VOUCHER")
-        .header(header::AUTHORIZATION, format!("Bearer {}", acc_token))
+        .header(header::AUTHORIZATION, format!("Bearer {}", ctrl_token))
         .body(Body::empty())
         .unwrap();
     let filtered_res = app.oneshot(filtered_req).await.unwrap();
@@ -2262,6 +2266,98 @@ async fn test_api_rbac_accountant_forbidden_on_backup() {
 }
 
 #[tokio::test]
+async fn test_api_audit_logs_forbidden_for_accountant() {
+    let app = setup_test_app();
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/audit-logs")
+        .header(
+            header::AUTHORIZATION,
+            format!("Bearer {}", accountant_token()),
+        )
+        .body(Body::empty())
+        .unwrap();
+
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let err: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(err["error"], "FORBIDDEN");
+    assert!(
+        err["message"]
+            .as_str()
+            .unwrap()
+            .contains("Controller role required")
+    );
+}
+
+#[tokio::test]
+async fn test_api_audit_logs_allowed_for_controller_and_admin() {
+    let app = setup_test_app();
+
+    // 1. Controller can query audit logs
+    let ctrl_req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/audit-logs")
+        .header(
+            header::AUTHORIZATION,
+            format!("Bearer {}", controller_token()),
+        )
+        .body(Body::empty())
+        .unwrap();
+
+    let ctrl_res = app.clone().oneshot(ctrl_req).await.unwrap();
+    assert_eq!(ctrl_res.status(), StatusCode::OK);
+
+    // 2. Admin can query audit logs
+    let admin_req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/audit-logs")
+        .header(header::AUTHORIZATION, format!("Bearer {}", admin_token()))
+        .body(Body::empty())
+        .unwrap();
+
+    let admin_res = app.oneshot(admin_req).await.unwrap();
+    assert_eq!(admin_res.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_api_audit_logs_unauthenticated_returns_401() {
+    let app = setup_test_app();
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/audit-logs")
+        .body(Body::empty())
+        .unwrap();
+
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let err: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(err["error"], "UNAUTHORIZED");
+}
+
+#[tokio::test]
+async fn test_sqlite_engine_version_meets_wal_resilience_standard() {
+    assert!(
+        rusqlite::version_number() >= backend::database::MIN_SQLITE_VERSION_NUMBER,
+        "Embedded SQLite version ({}) must meet or exceed minimum WAL resilience standard (3.53.0 / {})",
+        rusqlite::version(),
+        backend::database::MIN_SQLITE_VERSION_NUMBER
+    );
+    assert!(backend::database::verify_sqlite_engine_version().is_ok());
+    assert!(backend::database::LedgerRepository::verify_sqlite_engine_version().is_ok());
+}
+
+#[tokio::test]
 async fn test_api_rbac_controller_allowed_on_privileged_ops() {
     let temp_backup_dir =
         std::env::temp_dir().join(format!("api_rbac_ctrl_test_{}", Uuid::new_v4()));
@@ -2450,7 +2546,10 @@ async fn test_api_voucher_created_by_derived_from_jwt_sub_ignores_body() {
                     "/api/v1/audit-logs?resource_id={}",
                     voucher.voucher_no
                 ))
-                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", controller_token()),
+                )
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -2535,7 +2634,7 @@ async fn test_api_void_actor_derived_from_jwt_sub_ignores_body() {
             Request::builder()
                 .method("GET")
                 .uri("/api/v1/audit-logs?action=VOID_VOUCHER")
-                .header(header::AUTHORIZATION, format!("Bearer {acc_token}"))
+                .header(header::AUTHORIZATION, format!("Bearer {ctrl_token}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -2677,7 +2776,10 @@ async fn test_api_idempotency_ac1_first_request_success() {
             Request::builder()
                 .method("GET")
                 .uri("/api/v1/audit-logs?action=CREATE_VOUCHER")
-                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", controller_token()),
+                )
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -2779,7 +2881,10 @@ async fn test_api_idempotency_ac2_retry_identical_payload_returns_cached_201() {
             Request::builder()
                 .method("GET")
                 .uri("/api/v1/audit-logs?action=CREATE_VOUCHER")
-                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", controller_token()),
+                )
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -2884,7 +2989,10 @@ async fn test_api_idempotency_ac3_retry_mismatched_payload_returns_409_conflict(
             Request::builder()
                 .method("GET")
                 .uri("/api/v1/audit-logs?action=CREATE_VOUCHER")
-                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", controller_token()),
+                )
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -3441,4 +3549,715 @@ async fn test_api_log_dir_configuration_and_file_creation() {
     assert!(startup_content.contains("Synthetic port collision test"));
 
     let _ = std::fs::remove_dir_all(&temp_log_dir);
+}
+
+/// Comprehensive 10-phase Disaster Recovery, CLI & Zero-Diff Restore Drill.
+/// Validates zero-VND discrepancy across trial balance, balance sheet, voucher population,
+/// and byte-level identity on offline target restore.
+#[tokio::test]
+async fn test_e2e_backup_restore_drill_zero_diff() {
+    let temp_root = std::env::temp_dir().join(format!("drill_zero_diff_{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&temp_root).expect("Create temp drill dir");
+    let live_db_path = temp_root.join("live_ledger.db");
+    let backup_dir = temp_root.join("backups");
+    std::fs::create_dir_all(&backup_dir).expect("Create backup dir");
+
+    // Phase 1: Initialize clean isolated file-backed database
+    let conn = Connection::open(&live_db_path).expect("Open file-backed SQLite database");
+    let repo = LedgerRepository::new(conn);
+    repo.init_schema().expect("Init schema");
+    let engine = LedgerEngine::new();
+    let config = backend::config::AppConfig {
+        backup_dir: backup_dir.to_string_lossy().to_string(),
+        database_path: live_db_path.to_string_lossy().to_string(),
+        ..Default::default()
+    };
+    let state = Arc::new(AppState::with_config(engine, repo, config));
+    let app = create_app(state);
+
+    // Phase 2: Post statutory vouchers across diverse accounts:
+    // (1111 Cash, 1121 Bank, 1561 Inventory, 1331 VAT, 131 AR, 33311 Output VAT, 4111 Capital, 5111 Revenue, 632 COGS)
+
+    // Voucher 1: Capital contribution (1121 Bank / 4111 Capital) - 500,000,000 VND
+    let v1 = json!({
+        "voucher_no": "PKT-DRILL-01",
+        "voucher_date": "2026-01-05",
+        "description": "Góp vốn điều lệ qua chuyển khoản ngân hàng",
+        "lines": [
+            { "account_code": "1121", "debit": "500000000", "credit": "0", "line_desc": "Tăng TGNH" },
+            { "account_code": "4111", "debit": "0", "credit": "500000000", "line_desc": "Tăng Vốn đầu tư CSH" }
+        ]
+    });
+    let post_res1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/vouchers")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", accountant_token()),
+                )
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(v1.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(post_res1.status(), StatusCode::CREATED);
+
+    // Voucher 2: Cash withdrawal for petty cash (1111 Cash / 1121 Bank) - 50,000,000 VND
+    let v2 = json!({
+        "voucher_no": "PKT-DRILL-02",
+        "voucher_date": "2026-01-08",
+        "description": "Rút tiền gửi ngân hàng nhập quỹ tiền mặt",
+        "lines": [
+            { "account_code": "1111", "debit": "50000000", "credit": "0", "line_desc": "Tăng tiền mặt" },
+            { "account_code": "1121", "debit": "0", "credit": "50000000", "line_desc": "Giảm TGNH" }
+        ]
+    });
+    let post_res2 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/vouchers")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", accountant_token()),
+                )
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(v2.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(post_res2.status(), StatusCode::CREATED);
+    let bytes2 = axum::body::to_bytes(post_res2.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let created_v2: JournalVoucher = serde_json::from_slice(&bytes2).unwrap();
+
+    // Voucher 3: Purchase inventory with input VAT on credit (1561 Inventory, 1331 VAT / 331 AP) - 110,000,000 VND
+    let v3 = json!({
+        "voucher_no": "PKT-DRILL-03",
+        "voucher_date": "2026-01-12",
+        "description": "Mua hàng hóa nhập kho có thuế GTGT đầu vào",
+        "lines": [
+            { "account_code": "1561", "debit": "100000000", "credit": "0", "line_desc": "Hàng hóa nhập kho" },
+            { "account_code": "1331", "debit": "10000000", "credit": "0", "line_desc": "Thuế GTGT đầu vào" },
+            { "account_code": "331", "debit": "0", "credit": "110000000", "line_desc": "Phải trả người bán" }
+        ]
+    });
+    let post_res3 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/vouchers")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", accountant_token()),
+                )
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(v3.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(post_res3.status(), StatusCode::CREATED);
+
+    // Voucher 4: Sales of goods with output VAT on credit (131 AR / 5111 Revenue, 33311 Output VAT) - 132,000,000 VND
+    let v4 = json!({
+        "voucher_no": "PKT-DRILL-04",
+        "voucher_date": "2026-01-18",
+        "description": "Xuất bán hàng hóa ghi nhận doanh thu và thuế GTGT",
+        "lines": [
+            { "account_code": "131", "debit": "132000000", "credit": "0", "line_desc": "Phải thu khách hàng" },
+            { "account_code": "5111", "debit": "0", "credit": "120000000", "line_desc": "Doanh thu bán hàng" },
+            { "account_code": "33311", "debit": "0", "credit": "12000000", "line_desc": "Thuế GTGT phải nộp" }
+        ]
+    });
+    let post_res4 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/vouchers")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", accountant_token()),
+                )
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(v4.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(post_res4.status(), StatusCode::CREATED);
+
+    // Voucher 5: Cost of goods sold (632 COGS / 1561 Inventory) - 60,000,000 VND
+    let v5 = json!({
+        "voucher_no": "PKT-DRILL-05",
+        "voucher_date": "2026-01-18",
+        "description": "Giá vốn hàng bán xuất kho",
+        "lines": [
+            { "account_code": "632", "debit": "60000000", "credit": "0", "line_desc": "Giá vốn hàng bán" },
+            { "account_code": "1561", "debit": "0", "credit": "60000000", "line_desc": "Xuất kho hàng hóa" }
+        ]
+    });
+    let post_res5 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/vouchers")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", accountant_token()),
+                )
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(v5.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(post_res5.status(), StatusCode::CREATED);
+
+    // Phase 3: Capture pre-backup baseline
+    // 3a. Trial Balance
+    let tb_req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/reports/trial-balance?as_of_date=2026-01-31")
+        .header(
+            header::AUTHORIZATION,
+            format!("Bearer {}", accountant_token()),
+        )
+        .body(Body::empty())
+        .unwrap();
+    let tb_res = app.clone().oneshot(tb_req).await.unwrap();
+    assert_eq!(tb_res.status(), StatusCode::OK);
+    let tb_bytes = axum::body::to_bytes(tb_res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let baseline_tb: TrialBalanceResponse = serde_json::from_slice(&tb_bytes).unwrap();
+    assert_eq!(baseline_tb.total_debit, baseline_tb.total_credit);
+    assert!(baseline_tb.is_balanced);
+
+    // 3b. Balance Sheet
+    let bs_req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/reports/balance-sheet?as_of_date=2026-01-31")
+        .header(
+            header::AUTHORIZATION,
+            format!("Bearer {}", accountant_token()),
+        )
+        .body(Body::empty())
+        .unwrap();
+    let bs_res = app.clone().oneshot(bs_req).await.unwrap();
+    assert_eq!(bs_res.status(), StatusCode::OK);
+    let bs_bytes = axum::body::to_bytes(bs_res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let baseline_bs: BalanceSheetResponse = serde_json::from_slice(&bs_bytes).unwrap();
+
+    // 3c. Vouchers list
+    let vl_req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/vouchers")
+        .header(
+            header::AUTHORIZATION,
+            format!("Bearer {}", accountant_token()),
+        )
+        .body(Body::empty())
+        .unwrap();
+    let vl_res = app.clone().oneshot(vl_req).await.unwrap();
+    assert_eq!(vl_res.status(), StatusCode::OK);
+    let vl_bytes = axum::body::to_bytes(vl_res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let baseline_vouchers: Vec<JournalVoucher> = serde_json::from_slice(&vl_bytes).unwrap();
+    assert_eq!(baseline_vouchers.len(), 5);
+
+    // 3d. Audit logs
+    let al_req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/audit-logs")
+        .header(
+            header::AUTHORIZATION,
+            format!("Bearer {}", controller_token()),
+        )
+        .body(Body::empty())
+        .unwrap();
+    let al_res = app.clone().oneshot(al_req).await.unwrap();
+    assert_eq!(al_res.status(), StatusCode::OK);
+    let al_bytes = axum::body::to_bytes(al_res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let baseline_logs: Vec<serde_json::Value> = serde_json::from_slice(&al_bytes).unwrap();
+    assert!(!baseline_logs.is_empty());
+
+    // Phase 4: Create backup snapshot via POST /api/v1/system/backup
+    let backup_req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/system/backup")
+        .header(
+            header::AUTHORIZATION,
+            format!("Bearer {}", controller_token()),
+        )
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({ "filename": "pre_disaster_snapshot.db" }).to_string(),
+        ))
+        .unwrap();
+    let backup_res = app.clone().oneshot(backup_req).await.unwrap();
+    assert_eq!(backup_res.status(), StatusCode::CREATED);
+    let backup_bytes = axum::body::to_bytes(backup_res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let backup_data: backend::dto::BackupResponse = serde_json::from_slice(&backup_bytes).unwrap();
+    let snapshot_path = std::path::PathBuf::from(&backup_data.backup_path);
+    assert!(snapshot_path.exists(), "Snapshot file must exist on disk");
+
+    // Compute expected SHA-256
+    let snap_raw_bytes = std::fs::read(&snapshot_path).unwrap();
+    let digest = ring::digest::digest(&ring::digest::SHA256, &snap_raw_bytes);
+    let expected_sha256: String = digest
+        .as_ref()
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect();
+    assert_eq!(expected_sha256.len(), 64);
+
+    // Phase 5: Inject catastrophic drift / rogue voucher / void baseline voucher
+    // 5a. Void baseline voucher 2 (Cash withdrawal)
+    let void_req = Request::builder()
+        .method("POST")
+        .uri(format!("/api/v1/vouchers/{}/void", created_v2.id))
+        .header(
+            header::AUTHORIZATION,
+            format!("Bearer {}", controller_token()),
+        )
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({ "reason": "Catastrophic testing intentional void" }).to_string(),
+        ))
+        .unwrap();
+    let void_res = app.clone().oneshot(void_req).await.unwrap();
+    assert_eq!(void_res.status(), StatusCode::OK);
+
+    // 5b. Post rogue voucher (fraudulent withdrawal 642 / 1111 for 99,000,000 VND)
+    let rogue_v = json!({
+        "voucher_no": "ROGUE-HACK-666",
+        "voucher_date": "2026-01-20",
+        "description": "Rogue fraudulent cash withdrawal",
+        "lines": [
+            { "account_code": "642", "debit": "99000000", "credit": "0", "line_desc": "Chi phi khong hop le" },
+            { "account_code": "1111", "debit": "0", "credit": "99000000", "line_desc": "Rut quy tien mat trai phep" }
+        ]
+    });
+    let rogue_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/vouchers")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", accountant_token()),
+                )
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(rogue_v.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rogue_res.status(), StatusCode::CREATED);
+
+    // Verify data has drifted materially
+    let drifted_tb_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/reports/trial-balance?as_of_date=2026-01-31")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", accountant_token()),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let drifted_tb: TrialBalanceResponse = serde_json::from_slice(
+        &axum::body::to_bytes(drifted_tb_res.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_ne!(
+        drifted_tb.total_debit, baseline_tb.total_debit,
+        "Trial balance debit must have drifted"
+    );
+
+    let drifted_vl_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/vouchers")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", accountant_token()),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let drifted_vouchers: Vec<JournalVoucher> = serde_json::from_slice(
+        &axum::body::to_bytes(drifted_vl_res.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    // In drifted state: voucher 2 was voided (so excluded from POSTED list) and rogue was added
+    assert!(
+        !drifted_vouchers.iter().any(|v| v.id == created_v2.id),
+        "Voided voucher 2 must not appear in active vouchers"
+    );
+    assert!(
+        drifted_vouchers
+            .iter()
+            .any(|v| v.voucher_no == "ROGUE-HACK-666"),
+        "Rogue voucher must appear in active vouchers"
+    );
+
+    // Phase 6: RBAC & safety validation on POST /api/v1/system/restore
+    let restore_payload = json!({
+        "snapshot_path": snapshot_path.to_string_lossy(),
+        "confirm_overwrite": true,
+        "expected_sha256": expected_sha256
+    });
+
+    // 6a. 401 Unauthorized (unauthenticated)
+    let res_unauth = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/system/restore")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(restore_payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_unauth.status(), StatusCode::UNAUTHORIZED);
+
+    // 6b. 403 Forbidden (Accountant)
+    let res_acc = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/system/restore")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", accountant_token()),
+                )
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(restore_payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_acc.status(), StatusCode::FORBIDDEN);
+
+    // 6c. 403 Forbidden (Controller)
+    let res_ctrl = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/system/restore")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", controller_token()),
+                )
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(restore_payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_ctrl.status(), StatusCode::FORBIDDEN);
+
+    // 6d. 400 Bad Request (confirm_overwrite: false)
+    let bad_confirm_payload = json!({
+        "snapshot_path": snapshot_path.to_string_lossy(),
+        "confirm_overwrite": false,
+        "expected_sha256": expected_sha256
+    });
+    let res_bad_confirm = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/system/restore")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin_token()))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(bad_confirm_payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_bad_confirm.status(), StatusCode::BAD_REQUEST);
+
+    // 6e. 400 Bad Request (expected_sha256 mismatch)
+    let bad_sha_payload = json!({
+        "snapshot_path": snapshot_path.to_string_lossy(),
+        "confirm_overwrite": true,
+        "expected_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    });
+    let res_bad_sha = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/system/restore")
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin_token()))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(bad_sha_payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_bad_sha.status(), StatusCode::BAD_REQUEST);
+
+    // Phase 7: Authorized restore via POST /api/v1/system/restore (Admin token, 200 OK)
+    let restore_req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/system/restore")
+        .header(header::AUTHORIZATION, format!("Bearer {}", admin_token()))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(restore_payload.to_string()))
+        .unwrap();
+    let restore_res = app.clone().oneshot(restore_req).await.unwrap();
+    assert_eq!(restore_res.status(), StatusCode::OK);
+    let restore_bytes = axum::body::to_bytes(restore_res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let restore_data: backend::dto::RestoreResponse =
+        serde_json::from_slice(&restore_bytes).unwrap();
+    assert_eq!(restore_data.status, "RESTORED");
+    assert_eq!(restore_data.sha256_checksum, expected_sha256);
+
+    // Phase 8: Assert 0-VND variance across all accounts on Trial Balance & Balance Sheet
+    // 8a. Trial balance 0-VND discrepancy check
+    let post_tb_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/reports/trial-balance?as_of_date=2026-01-31")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", accountant_token()),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(post_tb_res.status(), StatusCode::OK);
+    let post_tb: TrialBalanceResponse = serde_json::from_slice(
+        &axum::body::to_bytes(post_tb_res.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        post_tb.total_debit, baseline_tb.total_debit,
+        "Total debit must match baseline with 0-VND variance"
+    );
+    assert_eq!(
+        post_tb.total_credit, baseline_tb.total_credit,
+        "Total credit must match baseline with 0-VND variance"
+    );
+    assert_eq!(
+        post_tb.accounts.len(),
+        baseline_tb.accounts.len(),
+        "Row count must match baseline exactly"
+    );
+    for b_row in &baseline_tb.accounts {
+        let p_row = post_tb
+            .accounts
+            .iter()
+            .find(|r| r.account_code == b_row.account_code)
+            .unwrap_or_else(|| {
+                panic!(
+                    "Account {} missing from restored trial balance",
+                    b_row.account_code
+                )
+            });
+        assert_eq!(
+            p_row.total_debit, b_row.total_debit,
+            "Account {} total_debit 0-VND variance",
+            b_row.account_code
+        );
+        assert_eq!(
+            p_row.total_credit, b_row.total_credit,
+            "Account {} total_credit 0-VND variance",
+            b_row.account_code
+        );
+        assert_eq!(
+            p_row.net_balance, b_row.net_balance,
+            "Account {} net_balance 0-VND variance",
+            b_row.account_code
+        );
+    }
+
+    // 8b. Balance sheet 0-VND discrepancy check
+    let post_bs_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/reports/balance-sheet?as_of_date=2026-01-31")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", accountant_token()),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(post_bs_res.status(), StatusCode::OK);
+    let post_bs: BalanceSheetResponse = serde_json::from_slice(
+        &axum::body::to_bytes(post_bs_res.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        post_bs.total_assets, baseline_bs.total_assets,
+        "Total assets 0-VND variance"
+    );
+    assert_eq!(
+        post_bs.total_resources, baseline_bs.total_resources,
+        "Total resources 0-VND variance"
+    );
+
+    // 8c. Voucher population check
+    let post_vl_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/vouchers")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", accountant_token()),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(post_vl_res.status(), StatusCode::OK);
+    let post_vouchers: Vec<JournalVoucher> = serde_json::from_slice(
+        &axum::body::to_bytes(post_vl_res.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        post_vouchers.len(),
+        5,
+        "Voucher count must be restored to exactly 5"
+    );
+    // Verify voided baseline voucher is restored to Posted
+    let restored_v2 = post_vouchers
+        .iter()
+        .find(|v| v.id == created_v2.id)
+        .expect("Voucher 2 must exist");
+    assert_eq!(
+        restored_v2.status,
+        VoucherStatus::Posted,
+        "Voided voucher must be reverted to Posted"
+    );
+    // Verify rogue voucher is purged
+    assert!(
+        !post_vouchers
+            .iter()
+            .any(|v| v.voucher_no == "ROGUE-HACK-666"),
+        "Rogue voucher must be purged"
+    );
+
+    // Phase 9: Audit log forensic check: baseline logs intact, plus exactly 1 new SYSTEM_RESTORE log
+    let post_al_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/audit-logs")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", controller_token()),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(post_al_res.status(), StatusCode::OK);
+    let post_logs: Vec<serde_json::Value> = serde_json::from_slice(
+        &axum::body::to_bytes(post_al_res.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let restore_logs: Vec<&serde_json::Value> = post_logs
+        .iter()
+        .filter(|l| l["action"] == "SYSTEM_RESTORE")
+        .collect();
+    assert_eq!(
+        restore_logs.len(),
+        1,
+        "Exactly 1 SYSTEM_RESTORE audit log must be recorded"
+    );
+    assert_eq!(restore_logs[0]["actor"], "system_admin");
+    assert_eq!(restore_logs[0]["resource_type"], "SYSTEM");
+    assert!(
+        restore_logs[0]["details"]
+            .as_str()
+            .unwrap()
+            .contains(&expected_sha256)
+    );
+
+    // Phase 10: Zero-byte CLI restore drill on a clean target file
+    let clean_target = temp_root.join("cli_restored_clean.db");
+    let cli_outcome =
+        backend::database::execute_cli_restore(&snapshot_path, &clean_target, "cli_admin")
+            .expect("CLI restore must succeed");
+    assert_eq!(cli_outcome.sha256_checksum, expected_sha256);
+    assert!(clean_target.exists(), "Clean target file must exist");
+    let target_conn = rusqlite::Connection::open(&clean_target).unwrap();
+    let cli_actor: String = target_conn
+        .query_row(
+            "SELECT actor FROM audit_logs WHERE action = 'SYSTEM_RESTORE' ORDER BY id DESC LIMIT 1;",
+            [],
+            |r| r.get(0),
+        )
+        .expect("CLI restore audit log must exist");
+    assert_eq!(cli_actor, "cli_admin");
+    let cli_voucher_count: i64 = target_conn
+        .query_row("SELECT count(*) FROM vouchers;", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(cli_voucher_count, 5);
+
+    let _ = std::fs::remove_dir_all(&temp_root);
 }

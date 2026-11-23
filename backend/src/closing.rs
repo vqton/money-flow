@@ -33,6 +33,24 @@ impl PeriodClosingEngine {
         format!("KC-{year}-{month:02}")
     }
 
+    /// Calculates the start and end NaiveDate bounds for a given fiscal year and starting month per Circular 99 Điều 31.
+    pub fn fiscal_year_bounds(
+        fiscal_year: i32,
+        start_month: u8,
+    ) -> Result<(NaiveDate, NaiveDate), AccountingError> {
+        fiscal_year_bounds(fiscal_year, start_month)
+    }
+
+    /// Determines the fiscal year for a given calendar date and starting month.
+    pub fn fiscal_year_for_date(date: NaiveDate, start_month: u8) -> i32 {
+        fiscal_year_for_date(date, start_month)
+    }
+
+    /// Determines the 1-based fiscal period (1..=12) for a given calendar date and starting month.
+    pub fn fiscal_period_for_date(date: NaiveDate, start_month: u8) -> u32 {
+        fiscal_period_for_date(date, start_month)
+    }
+
     /// Pure closing calculation: constructs the 4-step closing voucher from pre-aggregated account balances.
     ///
     /// Balances map is structured as `account_code -> (total_debit, total_credit)`.
@@ -312,6 +330,81 @@ impl PeriodClosingEngine {
     }
 }
 
+/// Returns the statutory start and end calendar dates for a fiscal year per Circular 99 Điều 31.
+///
+/// For calendar fiscal years (`start_month == 1`), bounds are `(YYYY-01-01, YYYY-12-31)`.
+/// For non-calendar fiscal years (`start_month > 1`), bounds span from `YYYY-{start_month:02}-01`
+/// to the last day of month `start_month - 1` in calendar year `YYYY + 1`.
+pub fn fiscal_year_bounds(
+    fiscal_year: i32,
+    start_month: u8,
+) -> Result<(NaiveDate, NaiveDate), AccountingError> {
+    if !(1..=12).contains(&start_month) {
+        return Err(AccountingError::InvalidPeriod {
+            year: fiscal_year,
+            month: start_month as u32,
+        });
+    }
+
+    let start_date = NaiveDate::from_ymd_opt(fiscal_year, start_month as u32, 1).ok_or(
+        AccountingError::InvalidPeriod {
+            year: fiscal_year,
+            month: start_month as u32,
+        },
+    )?;
+
+    let (end_year, end_month) = if start_month == 1 {
+        (fiscal_year, 12u32)
+    } else {
+        let next_year = fiscal_year
+            .checked_add(1)
+            .ok_or(AccountingError::InvalidPeriod {
+                year: fiscal_year,
+                month: start_month as u32,
+            })?;
+        (next_year, (start_month - 1) as u32)
+    };
+
+    let end_date = PeriodClosingEngine::last_day_of_month(end_year, end_month)?;
+    Ok((start_date, end_date))
+}
+
+/// Determines the fiscal year for a given calendar date and starting month.
+///
+/// For dates on or after `start_month`, the fiscal year is `date.year()`.
+/// For dates before `start_month`, the fiscal year is `date.year() - 1`.
+/// If `start_month` is outside `1..=12`, falls back to calendar year (start month 1).
+pub fn fiscal_year_for_date(date: NaiveDate, start_month: u8) -> i32 {
+    use chrono::Datelike;
+    let s = if (1..=12).contains(&start_month) {
+        start_month
+    } else {
+        1
+    };
+    let m = date.month() as u8;
+    if m >= s { date.year() } else { date.year() - 1 }
+}
+
+/// Determines the 1-based fiscal period (1..=12) for a given calendar date and starting month.
+///
+/// For example, with `start_month = 4`:
+/// - April is Period 1
+/// - December is Period 9
+/// - January of next year is Period 10
+/// - March of next year is Period 12
+///
+/// If `start_month` is outside `1..=12`, falls back to calendar month (start month 1).
+pub fn fiscal_period_for_date(date: NaiveDate, start_month: u8) -> u32 {
+    use chrono::Datelike;
+    let s = if (1..=12).contains(&start_month) {
+        start_month as u32
+    } else {
+        1
+    };
+    let m = date.month();
+    if m >= s { m - s + 1 } else { 12 - s + m + 1 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -478,5 +571,75 @@ mod tests {
             dec!(195000000),
             "Account 911 total throughput must be 195,000,000"
         );
+    }
+
+    #[test]
+    fn test_fiscal_year_bounds_calendar() {
+        let (start, end) = fiscal_year_bounds(2026, 1).unwrap();
+        assert_eq!(start, NaiveDate::from_ymd_opt(2026, 1, 1).unwrap());
+        assert_eq!(end, NaiveDate::from_ymd_opt(2026, 12, 31).unwrap());
+    }
+
+    #[test]
+    fn test_fiscal_year_bounds_non_calendar() {
+        let (start, end) = fiscal_year_bounds(2026, 4).unwrap();
+        assert_eq!(start, NaiveDate::from_ymd_opt(2026, 4, 1).unwrap());
+        assert_eq!(end, NaiveDate::from_ymd_opt(2027, 3, 31).unwrap());
+
+        let (start, end) = fiscal_year_bounds(2026, 7).unwrap();
+        assert_eq!(start, NaiveDate::from_ymd_opt(2026, 7, 1).unwrap());
+        assert_eq!(end, NaiveDate::from_ymd_opt(2027, 6, 30).unwrap());
+
+        let (start, end) = fiscal_year_bounds(2026, 10).unwrap();
+        assert_eq!(start, NaiveDate::from_ymd_opt(2026, 10, 1).unwrap());
+        assert_eq!(end, NaiveDate::from_ymd_opt(2027, 9, 30).unwrap());
+    }
+
+    #[test]
+    fn test_fiscal_year_bounds_leap_year() {
+        let (start, end) = fiscal_year_bounds(2027, 3).unwrap();
+        assert_eq!(start, NaiveDate::from_ymd_opt(2027, 3, 1).unwrap());
+        assert_eq!(end, NaiveDate::from_ymd_opt(2028, 2, 29).unwrap());
+    }
+
+    #[test]
+    fn test_fiscal_year_bounds_invalid_start_month() {
+        assert!(fiscal_year_bounds(2026, 0).is_err());
+        assert!(fiscal_year_bounds(2026, 13).is_err());
+    }
+
+    #[test]
+    fn test_fiscal_year_bounds_overflow_protection() {
+        assert!(fiscal_year_bounds(i32::MAX, 4).is_err());
+    }
+
+    #[test]
+    fn test_fiscal_year_for_date() {
+        let d1 = NaiveDate::from_ymd_opt(2026, 4, 1).unwrap();
+        assert_eq!(fiscal_year_for_date(d1, 4), 2026);
+
+        let d2 = NaiveDate::from_ymd_opt(2027, 3, 31).unwrap();
+        assert_eq!(fiscal_year_for_date(d2, 4), 2026);
+
+        let d3 = NaiveDate::from_ymd_opt(2027, 4, 1).unwrap();
+        assert_eq!(fiscal_year_for_date(d3, 4), 2027);
+
+        let d4 = NaiveDate::from_ymd_opt(2026, 1, 15).unwrap();
+        assert_eq!(fiscal_year_for_date(d4, 1), 2026);
+    }
+
+    #[test]
+    fn test_fiscal_period_for_date() {
+        let d_apr = NaiveDate::from_ymd_opt(2026, 4, 15).unwrap();
+        assert_eq!(fiscal_period_for_date(d_apr, 4), 1);
+
+        let d_dec = NaiveDate::from_ymd_opt(2026, 12, 15).unwrap();
+        assert_eq!(fiscal_period_for_date(d_dec, 4), 9);
+
+        let d_jan = NaiveDate::from_ymd_opt(2027, 1, 15).unwrap();
+        assert_eq!(fiscal_period_for_date(d_jan, 4), 10);
+
+        let d_mar = NaiveDate::from_ymd_opt(2027, 3, 31).unwrap();
+        assert_eq!(fiscal_period_for_date(d_mar, 4), 12);
     }
 }

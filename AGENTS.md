@@ -40,6 +40,35 @@ Strict layered clean architecture (`backend/src/`):
 * `dto.rs` & `handlers.rs` (Interface Layer): Axum 0.8 routing, payload validation, status mapping, and OpenAPI specification. Imports domain, application, and persistence types.
 * `config.rs`: 12-factor environment configuration loader (`HOST`, `PORT`, `DATABASE_PATH`, `BACKUP_DIR`, `LOG_LEVEL`, `LOG_DIR`, `LOG_FORMAT`, `JWT_SECRET`).
 
+### 3.1 SOLID Principles & Design Patterns
+This project follows SOLID (Martin, *Agile Software Development* 2002; *Clean Architecture* 2017) and named enterprise patterns (Fowler, *PoEAA* 2002; Evans, *DDD* 2003). Every contributor — human or AI — must respect these boundaries:
+
+**SOLID enforcement:**
+* **Single Responsibility**: Each module has exactly one reason to change. A repository module owns CRUD for one aggregate; a handler orchestrates one use-case; a domain module validates one invariant set.
+* **Open–Closed**: Extend behavior by adding new files or modules, not by editing existing ones. New report types, new account categories, and new CLI subcommands each get their own module.
+* **Liskov Substitution**: Any trait implementation must honor the full contract of that trait. Never return `unimplemented!()` or silently skip a required behavior.
+* **Interface Segregation**: Consumers depend only on the methods they use. When a struct exposes methods for multiple audiences (e.g. voucher CRUD + reporting + disaster recovery), split it into focused traits or modules.
+* **Dependency Inversion**: Domain and application layers depend on abstractions, not on concrete persistence types. `closing.rs` receives balance maps (`BTreeMap`), not `LedgerRepository` directly.
+
+**Named patterns in use:**
+
+| Pattern | Module(s) | Boundary rule |
+|---|---|---|
+| Domain Model | `models.rs` | Pure data + `Display`/`FromStr`. No I/O, no business logic. |
+| Specification / Validator | `ledger.rs` | Stateless invariant checks. No database, no HTTP. |
+| Domain Service | `closing.rs` | Pure calculation from balance maps. No `Connection` handle. |
+| Repository | `database.rs` → future `db/*.rs` | One repository per aggregate. Owns SQL. No business rules. |
+| Unit of Work | SQLite transactions in `database.rs` | All mutations in a single `BEGIN..COMMIT` block. |
+| Data Transfer Object | `dto.rs` | Maps domain ↔ HTTP. Owns serialization attributes. |
+| Anti-Corruption Layer | `dto.rs` (`ApiError`) | Translates `AccountingError` → HTTP status codes. |
+| Application Service | `handlers.rs` | Orchestrates domain + repo. No SQL, no invariant logic. |
+| Guard / Protection Proxy | `auth.rs` | Typed role extractors (`RequireAdmin`, `RequireController`). |
+| Composition Root | `state.rs`, `main.rs` | Wires all dependencies. Only place that knows all concrete types. |
+| 12-Factor Config | `config.rs` | Environment-driven. No hard-coded connection strings or secrets. |
+| Observer | `diagnostics.rs` | Panic hook + tracing subscribers. |
+
+*References: McConnell, Code Complete 2e §24; Fowler, PoEAA Ch. 9–16; Evans, DDD Ch. 5, 8–9, 14; Martin, Clean Architecture Ch. 7–11; Ousterhout, A Philosophy of Software Design Ch. 4–5.*
+
 ## 4. Financial Safety Rules (Non-Negotiable)
 1. **Zero-Float Guarantee**: Use `rust_decimal::Decimal` for all amounts and account balances. Never use `f32` or `f64`. Store in SQLite columns as `TEXT`.
 2. **Double-Entry Invariants (`backend/src/ledger.rs`)**: Every voucher must have $\ge 2$ lines, amounts $\ge 0$, no dual debit/credit on a single line, no zero lines (`debit == 0 && credit == 0`), and strict zero-sum equilibrium: $\sum \text{Debits} == \sum \text{Credits} > 0$. Never bypass `validate_voucher()`.
@@ -59,6 +88,7 @@ Strict layered clean architecture (`backend/src/`):
 * **Error Handling**: Use `thiserror::Error` for domain errors (`AccountingError`). Map all HTTP responses to structured JSON `ApiError` (`dto.rs`).
 * **Logging**: Use `tracing::info!`, `warn!`, `error!`. Do not use `println!` or `eprintln!` in `backend/src/` (except test helpers).
 * **No Unjustified Panics**: Prohibit `unwrap()` and `expect()` in non-test application code unless provably unreachable and accompanied by an explanatory comment.
+* **Module Size Limits**: No single `.rs` source file should exceed **500 lines of production code** (excluding `#[cfg(test)]` blocks). When a module approaches this limit, decompose it into a directory module (`mod.rs` + focused submodules) in the same PR. Inline `#[cfg(test)]` blocks are exempt from the count but should follow their host module when it splits. *Rationale: McConnell, Code Complete 2e §24.2; El Emam et al. 2001 — file size is the strongest single predictor of fault-proneness.*
 
 ## 7. Testing Rules
 * Every money calculation or invariant change requires a unit test in `--lib`.

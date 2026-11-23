@@ -11,14 +11,15 @@ use serde_json::json;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::auth::{AuthenticatedUser, RequireController};
+use crate::auth::{AuthenticatedUser, RequireAdmin, RequireController};
 use crate::closing::PeriodClosingEngine;
 use crate::database::SaveVoucherOutcome;
 use crate::dto::{
     ApiError, AuditLogQuery, BackupRequest, BackupResponse, BalanceSheetQuery,
     BalanceSheetResponse, ClosePeriodRequest, CreateVoucherRequest, DateRangeQuery, IdempotencyKey,
     IncomeStatementQuery, IncomeStatementResponse, PeriodStatusResponse, ReopenPeriodRequest,
-    TrialBalanceResponse, VoidVoucherRequest, compute_request_hash,
+    RestoreRequest, RestoreResponse, TrialBalanceResponse, VoidVoucherRequest,
+    compute_request_hash,
 };
 use crate::ledger::AccountingError;
 use crate::models::{AccountingPeriod, AuditLogEntry, JournalVoucher, VoucherLine, VoucherStatus};
@@ -100,7 +101,9 @@ pub async fn create_voucher(
     };
 
     // 2. Invariant validation with LedgerEngine (THINK / CHECK)
-    state.engine.validate_voucher(&voucher)?;
+    state
+        .engine
+        .validate_voucher_with_validator(&voucher, &state.repo)?;
 
     // 3. Atomic persistence to SQLite with idempotency tracking (DO)
     let idempotency_param = idempotency_info
@@ -149,10 +152,11 @@ pub async fn void_voucher_handler(
 }
 
 /// Queries immutable system and accounting audit trail records.
+/// Restricted to Controller or Admin role.
 ///
 /// Route: GET /api/v1/audit-logs
 pub async fn list_audit_logs_handler(
-    _user: AuthenticatedUser,
+    RequireController(_): RequireController,
     State(state): State<Arc<AppState>>,
     Query(query): Query<AuditLogQuery>,
 ) -> Result<Json<Vec<AuditLogEntry>>, ApiError> {
@@ -389,6 +393,66 @@ pub async fn create_backup(
     ))
 }
 
+/// Executes an authorized disaster recovery restore of the live database from a snapshot.
+///
+/// Route: POST /api/v1/system/restore
+/// Guarded by: RequireAdmin
+pub async fn restore_backup_handler(
+    RequireAdmin(user): RequireAdmin,
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<RestoreRequest>,
+) -> Result<(StatusCode, Json<RestoreResponse>), ApiError> {
+    // Dual-secret confirmation check 1: confirm_overwrite must be true
+    if !req.confirm_overwrite {
+        return Err(ApiError::BadRequest(
+            "Dual-secret confirmation failed: 'confirm_overwrite' must be explicitly set to true"
+                .to_string(),
+        ));
+    }
+
+    // Dual-secret confirmation check 2: expected_sha256 must be provided
+    if req.expected_sha256.trim().is_empty() {
+        return Err(ApiError::BadRequest(
+            "Dual-secret confirmation failed: 'expected_sha256' is required".to_string(),
+        ));
+    }
+
+    // Format validation: SHA-256 must be 64 hexadecimal characters
+    let trimmed_sha = req.expected_sha256.trim();
+    if trimmed_sha.len() != 64 || !trimmed_sha.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(ApiError::BadRequest(
+            "Invalid SHA-256 checksum format: must be 64 hexadecimal characters".to_string(),
+        ));
+    }
+
+    // Path safety validation: forbid directory traversal
+    if req.snapshot_path.contains("..") {
+        return Err(ApiError::BadRequest(
+            "Invalid snapshot path: directory traversal is forbidden".to_string(),
+        ));
+    }
+
+    let snapshot_path = std::path::Path::new(&req.snapshot_path);
+
+    let outcome = state
+        .repo
+        .restore_from_snapshot(snapshot_path, Some(trimmed_sha), &user.claims.sub)
+        .map_err(|err| match err {
+            AccountingError::DatabaseError(msg) => ApiError::BadRequest(msg),
+            other => ApiError::from(other),
+        })?;
+
+    Ok((
+        StatusCode::OK,
+        Json(RestoreResponse {
+            status: "RESTORED".to_string(),
+            timestamp: outcome.timestamp,
+            restored_from_snapshot: outcome.restored_from_snapshot,
+            sha256_checksum: outcome.sha256_checksum,
+        }),
+    ))
+}
+
 /// Serves the OpenAPI 3.1 JSON specification.
 ///
 /// Route: GET /api-docs/openapi.json
@@ -453,6 +517,11 @@ pub fn create_app(state: Arc<AppState>) -> Router {
         .route("/api/v1/vouchers", post(create_voucher).get(list_vouchers))
         .route("/api/v1/vouchers/{id}", get(get_voucher))
         .route("/api/v1/vouchers/{id}/void", post(void_voucher_handler))
+        // Chart of Accounts
+        .route(
+            "/api/v1/accounts",
+            get(crate::accounts::list_accounts).post(crate::accounts::create_account),
+        )
         // Period Governance
         .route("/api/v1/periods", get(list_periods))
         .route("/api/v1/periods/close", post(close_period))
@@ -468,6 +537,7 @@ pub fn create_app(state: Arc<AppState>) -> Router {
         )
         // Disaster Recovery & System Backup
         .route("/api/v1/system/backup", post(create_backup))
+        .route("/api/v1/system/restore", post(restore_backup_handler))
         // Interactive OpenAPI 3.1 & Swagger UI
         .route("/api-docs/openapi.json", get(openapi_json_handler))
         .route("/swagger-ui", get(swagger_ui_handler))

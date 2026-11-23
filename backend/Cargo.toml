@@ -2,6 +2,7 @@
 name = "backend"
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 axum = { version = "0.8", features = ["macros"] }
@@ -13,7 +14,7 @@ tracing-appender = "0.2"
 chrono = { version = "0.4", features = ["serde"] }
 rust_decimal = { version = "1.43", features = ["serde"] }
 uuid = { version = "1", features = ["serde", "v4"] }
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.43", features = ["bundled", "backup"] }
 thiserror = "2.0.21"
 serde_json = "1.0"
 ring = "0.17"
