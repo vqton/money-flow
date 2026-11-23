@@ -6,6 +6,7 @@ pub mod catalog;
 pub mod closing;
 pub mod config;
 pub mod database;
+pub mod db;
 pub mod diagnostics;
 pub mod dto;
 pub mod handlers;

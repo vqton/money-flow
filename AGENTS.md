@@ -36,9 +36,9 @@ cargo run --manifest-path backend/Cargo.toml
 Strict layered clean architecture (`backend/src/`):
 * `models.rs` & `ledger.rs` (Domain Layer): Pure entities and invariant checks. **Must NEVER import** `axum`, `rusqlite`, or any I/O crate.
 * `closing.rs` (Application Workflow): Statutory 4-step closing engine. Relies on domain types and account balance maps; no direct database connection handles.
-* `database.rs` (Persistence Layer): SQLite connection mutex (`Arc<Mutex<Connection>>`), parameterized DDL/DML, transaction management, and audit logging.
-* `dto.rs` & `handlers.rs` (Interface Layer): Axum 0.8 routing, payload validation, status mapping, and OpenAPI specification. Imports domain, application, and persistence types.
-* `config.rs`: 12-factor environment configuration loader (`HOST`, `PORT`, `DATABASE_PATH`, `BACKUP_DIR`, `LOG_LEVEL`, `LOG_DIR`, `LOG_FORMAT`, `JWT_SECRET`).
+* `db/` & `database.rs` (Persistence Layer): Decomposed SQLite repositories (`db/voucher_repo.rs`, `db/period_repo.rs`, `db/report_repo.rs`, `db/account_repo.rs`, `db/audit_repo.rs`, `db/disaster.rs`, `db/schema.rs`) managed by `LedgerRepository`, parameterized DDL/DML, transaction management, and audit logging.
+* `dto/` & `handlers/` (Interface Layer): Axum 0.8 routing, payload validation, status mapping, and OpenAPI specification decomposed into focused submodules under 500 lines. Imports domain, application, and persistence types.
+* `config.rs`: 12-factor environment configuration loader (`HOST`, `PORT`, `DATABASE_PATH`, `BACKUP_DIR`, `LOG_LEVEL`, `LOG_DIR`, `LOG_FORMAT`, `JWT_SECRET`, `FISCAL_YEAR_START_MONTH`).
 
 ### 3.1 SOLID Principles & Design Patterns
 This project follows SOLID (Martin, *Agile Software Development* 2002; *Clean Architecture* 2017) and named enterprise patterns (Fowler, *PoEAA* 2002; Evans, *DDD* 2003). Every contributor — human or AI — must respect these boundaries:
@@ -57,11 +57,11 @@ This project follows SOLID (Martin, *Agile Software Development* 2002; *Clean Ar
 | Domain Model | `models.rs` | Pure data + `Display`/`FromStr`. No I/O, no business logic. |
 | Specification / Validator | `ledger.rs` | Stateless invariant checks. No database, no HTTP. |
 | Domain Service | `closing.rs` | Pure calculation from balance maps. No `Connection` handle. |
-| Repository | `database.rs` → future `db/*.rs` | One repository per aggregate. Owns SQL. No business rules. |
-| Unit of Work | SQLite transactions in `database.rs` | All mutations in a single `BEGIN..COMMIT` block. |
-| Data Transfer Object | `dto.rs` | Maps domain ↔ HTTP. Owns serialization attributes. |
-| Anti-Corruption Layer | `dto.rs` (`ApiError`) | Translates `AccountingError` → HTTP status codes. |
-| Application Service | `handlers.rs` | Orchestrates domain + repo. No SQL, no invariant logic. |
+| Repository | `db/*.rs` & `database.rs` facade | One repository per aggregate (`voucher_repo`, `account_repo`, etc.). Owns SQL. No business rules. |
+| Unit of Work | SQLite transactions in `db/*.rs` | All mutations in a single `BEGIN..COMMIT` block. |
+| Data Transfer Object | `dto/requests.rs`, `dto/mod.rs` | Maps domain ↔ HTTP. Owns serialization attributes. |
+| Anti-Corruption Layer | `dto/error.rs` (`ApiError`) | Translates `AccountingError` → HTTP status codes. |
+| Application Service | `handlers/*.rs` | Orchestrates domain + repo. No SQL, no invariant logic. |
 | Guard / Protection Proxy | `auth.rs` | Typed role extractors (`RequireAdmin`, `RequireController`). |
 | Composition Root | `state.rs`, `main.rs` | Wires all dependencies. Only place that knows all concrete types. |
 | 12-Factor Config | `config.rs` | Environment-driven. No hard-coded connection strings or secrets. |
