@@ -1,89 +1,88 @@
-# Project Decisions: `money-flow`
+# Architectural & Statutory Decisions: `money-flow`
 
-**Status**: Architectural Decision Register (ADR) — **APPROVED BY CFO**  
-**Tracking Context**: Implementation Roadmap (TT 99/2025/TT-BTC, QĐ 1233/QĐ-CT)  
-**Updated & Approved**: 2026-11-23  
-
----
-
-## Decision Gate Summary
-
-All primary blocking architectural and regulatory decisions have been formally evaluated and **APPROVED** by the Principal CFO on 2026-11-23. Downstream tasks in `TASKS.md` previously blocked are now **UNBLOCKED** and scheduled.
-
-| ID | Decision Title | Owner | Impacted Gaps | Decision Result | Status |
-| :--- | :--- | :--- | :---: | :--- | :---: |
-| **D1** | E-Invoice Strategy: Provider API vs. In-House XML | PO + CFO | G8 | **Option B**: Certified Provider REST API (VNPT/Viettel/MISA) | **APPROVED** |
-| **D2** | Tax & Invoice Rounding Protocol (QĐ 1233) | Chief Accountant / Tax Advisor | G6 | **Option B**: Subtotal per Tax Rate + GL Residual Adjustment | **APPROVED** |
-| **D3** | Tenancy Model: Single-Tenant vs. In-Process Pool | PO + Tech Lead | G13 | **Option A**: Process/Container-per-Company for Phase 1 | **APPROVED** |
-| **D4** | Subledger Partner Dimension (TK 131/331) in MVP | BA + PO | G15 | **Option A**: Include in Phase 1 MVP (`partner_id` mandatory) | **APPROVED** |
-| **D5** | Pilot Scope & Parallel Run Protocol | CFO | Phase 3 | **Option A**: Single Entity Pilot with Q3/Q4 2026 Back-Testing | **APPROVED** |
-| **D6** | Go-Live Target Schedule | PO | All | **2026-12-31 (Phase 1 GL Cutover) / 2026-12-30 (E-Invoice)** | **APPROVED** |
+**Status**: Architectural Decision Register (ADR) — Open vs Approved Tracking  
+**Standard**: Blocking decisions D1–D6 must be explicitly resolved before dependent tasks can be scheduled.  
+**Updated**: 2026-11-23  
 
 ---
 
-## Detailed Decision Records
+## 1. Decision Status Overview
 
-### D1: E-Invoice Delivery Strategy (Build vs. Partner API)
-- **Problem Statement**: QĐ 1233/QĐ-CT mandates e-invoice data components and message schemas (types 200, 202, 203, 300) with DSig / XAdES digital signatures by **01/01/2027**.
-- **Determination**: **OPTION B (Certified E-Invoice Provider Integration via Clean Domain Adapter)**.
-  - Implement a Rust domain trait `InvoiceTransmitter` in `backend/src/`.
-  - Provide an initial production adapter targeting a certified Vietnamese e-invoice provider REST API (e.g., VNPT, Viettel, MISA, BKAV).
-  - The provider absorbs tax authority transmission protocols, GDT test certifications, and cryptographic HSM token handshakes.
-  - Eliminates the risk of missing the statutory 01/01/2027 deadline. In-house direct T-VAN XML transmission is deferred to Phase 4.
-- **Approved By**: Principal CFO & PO (2026-11-23).
-- **Status**: **APPROVED** (Unblocks P2-03, P2-04).
+| ID | Title | Owner | Impacted Gaps | Status | Decision Summary & Constraints |
+| :--- | :--- | :--- | :---: | :---: | :--- |
+| **D1** | E-Invoice Strategy: Provider API vs In-House | PO + CFO | G8 | **APPROVED** | **Option B (Certified Provider API)**: Integrate certified provider REST API (VNPT/Viettel/MISA) via Rust domain adapter. In-house direct T-VAN XML deferred. |
+| **D2** | Tax & Invoice Rounding Protocol (QĐ 1233) | Chief Accountant / Tax Advisor | G6 | **APPROVED** | **Option B (Subtotal Grouped Rounding + GL Balancing)**: Calculate VAT on taxable subtotal per rate, half-up round to nearest đồng, auto-adjust $\pm 1$ đồng to GL (711/811). Ledger Decimal remains exact. |
+| **D3** | Tenancy Model: Single-Tenant vs Pool | PO + Tech Lead | G13 | **APPROVED** | **Option A (Container/Process-per-Company)**: One `backend.exe` process per company with isolated SQLite DB (`data/{tax_code}/accounting.db`). Multi-tenant pool deferred. |
+| **D4** | Partner Subledger Dimension in MVP | BA + PO | G15 | **APPROVED** | **Option A (Include in Phase 1 MVP)**: Require `partner_id` on AR (131) and AP (331) line items. |
+| **D5** | Pilot Scope & Parallel Run Protocol | CFO | Phase 3 | **APPROVED** | **Option A (Single Entity Pilot)**: Back-test Q3/Q4 2026 historical vouchers against legacy system to prove zero variance. |
+| **D6** | Go-Live Target Schedule | PO | All | **APPROVED** | **Target 2026-12-31 for Phase 1 GL cutover**; e-invoice provider integration target 2026-12-30. |
+
+---
+
+## 2. Detailed Decision Records
+
+### D1: E-Invoice Strategy: In-House XML vs Provider Integration
+- **Context & Problem**: QĐ 1233/QĐ-CT and NĐ 254/2026/NĐ-CP require direct or indirect T-VAN message catalogue (types 200, 202, 203, 300) with DSig / XAdES digital signatures by **01/01/2027**.
+- **Options**:
+  - *Option A (In-House Build)*: Implement XML schema builder, canonicalization (C14N), XAdES/DSig crypto, and direct T-VAN tax communication.
+  - *Option B (Certified Provider API)*: Implement clean domain trait `InvoiceTransmitter` and integrate with a licensed provider (VNPT, Viettel, MISA, BKAV) via authenticated REST API.
+- **Criteria**: Time-to-market (< 5 weeks remaining to 01/01/2027), risk of HSM compliance failure, maintenance cost.
+- **Decision**: **Option B (Certified Provider API)**.
+- **Owner**: PO + CFO.
+- **Approval Date**: 2026-11-23.
 
 ---
 
 ### D2: Rounding Method for VND Totals (QĐ 1233 / NĐ 174)
-- **Problem Statement**: QĐ 1233/QĐ-CT (trang 4) mandates that for VND transactions, all invoice totals (taxable amount, VAT amount, total payable) must be rounded to the nearest integer (*đồng*), with zero fractional decimals.
-- **Determination**: **OPTION B WITH GL RESIDUAL ADJUSTMENT (Subtotal Grouped Rounding per VAT Rate)**.
-  - Group voucher lines by statutory VAT rate (0%, 5%, 8%, 10%).
-  - Compute VAT on the exact Decimal taxable subtotal per rate.
-  - Round subtotal VAT to the nearest integer *đồng* using standard half-up arithmetic ($\ge 0.5$ rounds up, $< 0.5$ rounds down per NĐ 174 Điều 4 khoản 5).
-  - Double-entry ledger equilibrium strictly holds ($\sum \text{Debits} == \sum \text{Credits}$). Any $\pm 1$ đồng rounding discrepancy between subtotal tax and individual line sums is balanced automatically through the primary tax account or general ledger adjustment (`811` / `711`).
-- **Approved By**: Principal CFO & Chief Accountant (2026-11-23).
-- **Status**: **APPROVED** (Unblocks P2-01).
+- **Context & Problem**: QĐ 1233 (trang 4) mandates all VND invoice totals (taxable subtotal, VAT amount, payable) must be rounded to integer *đồng* (zero decimals). NĐ 174 Điều 4 khoản 5 mandates half-up rounding ($\ge 0.5 \rightarrow +1$).
+- **Options**:
+  - *Option A (Line-Level Rounding)*: Round tax on each invoice line to integer, sum lines. Risk: cumulative rounding drift on high-volume low-cost items.
+  - *Option B (Subtotal Grouped Rounding per Tax Rate)*: Sum line subtotals per rate, calculate VAT, round to integer đồng. Any $\pm 1$ đồng discrepancy with line sum is adjusted to general ledger income/expense (TK 711/811).
+- **Criteria**: Alignment with General Department of Taxation audit practices, mathematical stability.
+- **Decision**: **Option B (Subtotal Grouped Rounding per Rate with GL balancing)**.
+- **Owner**: Chief Accountant / Tax Advisor.
+- **Approval Date**: 2026-11-23.
 
 ---
 
-### D3: Tenancy Architecture (Multi-Tenancy Model)
-- **Problem Statement**: Corporate clients require strict data isolation across subsidiary companies.
-- **Determination**: **OPTION A (Single-Tenant Isolated Process/Container per Company)**.
-  - Run one `backend.exe` container/process per legal company, mapped to its own isolated SQLite database (`data/{company_tax_code}/accounting.db`).
-  - Guarantees 100% physical and cryptographic data segregation during statutory audits.
-  - Defer in-process multi-tenant dynamic connection pooling to Phase 4 (SaaS expansion).
-- **Approved By**: Principal CFO & Tech Lead (2026-11-23).
-- **Status**: **APPROVED**.
+### D3: Tenancy Architecture
+- **Context & Problem**: Statutory requirements demand strict data isolation between corporate entities during tax inspection and backup/restore drills.
+- **Options**:
+  - *Option A (Process-per-Company)*: One container/service instance per legal tax code, independent SQLite DB file.
+  - *Option B (Multi-Tenant In-Process Pool)*: Dynamic tenant routing via `X-Company-ID` with pooled connection manager.
+- **Criteria**: Delivery simplicity for Phase 1 cutover, audit safety, zero data bleed risk.
+- **Decision**: **Option A (Process-per-Company)** for Phase 1. Option B deferred to Phase 4 SaaS backlog.
+- **Owner**: PO + Tech Lead.
+- **Approval Date**: 2026-11-23.
 
 ---
 
-### D4: Subledger Partner Dimension (TK 131 / TK 331) in Phase 1 MVP
-- **Problem Statement**: Circular 99/2025/TT-BTC mandates partner-level accounting (*đối tượng công nợ*) for accounts receivable (TK 131) and accounts payable (TK 331).
-- **Determination**: **OPTION A (Include in Phase 1 MVP)**.
-  - Add `partner_id TEXT` (Tax Code/MST or Partner Code) and `partner_name TEXT` to `voucher_lines` table.
-  - In `validate_voucher()`, require `partner_id` whenever `account_code` begins with `131` or `331` (rejecting with `422 PARTNER_ID_REQUIRED` if omitted).
-  - Prevents breaking database migrations after initial go-live.
-- **Approved By**: Principal CFO & BA Lead (2026-11-23).
-- **Status**: **APPROVED** (Unblocks P1-09 for Sprint 2).
+### D4: Partner Subledger Dimension (TK 131 / TK 331) in MVP
+- **Context & Problem**: Circular 99 Phụ lục II requires tracking customer and supplier balances in detail.
+- **Options**:
+  - *Option A (Include in MVP)*: Add optional/mandatory `partner_id` to voucher lines posting to 131/331.
+  - *Option B (Defer to Phase 2)*: Keep voucher lines account-only; rely on description text.
+- **Criteria**: Compliance with statutory receivables/payables audit requirements.
+- **Decision**: **Option A (Include in MVP)**.
+- **Owner**: BA + PO.
+- **Approval Date**: 2026-11-23.
 
 ---
 
 ### D5: Pilot Scope & Parallel Run Protocol
-- **Problem Statement**: Audit-grade verification requires proving zero discrepancies against legacy software prior to decommissioning.
-- **Determination**: **OPTION A (Single Operating Entity Pilot with Historical Back-Testing)**.
-  - Ingest and post audited historical transactions from Q3 and Q4 2026 for 1 representative enterprise subsidiary.
-  - Run 4-step closing and compare Trial Balance, Statement of Financial Position, and Income Statement against reference audited statements.
-  - Require a signed **Zero-Variance Reconciliation Certificate** by the Chief Accountant before final production cutover.
-- **Approved By**: Principal CFO (2026-11-23).
-- **Status**: **APPROVED** (Unblocks P3-03).
+- **Context & Problem**: Phase 3 requires validating engine accuracy against existing corporate accounts before cutover.
+- **Options**:
+  - *Option A (Single Entity Historical Back-Testing)*: Re-run Q3 and Q4 2026 historical vouchers for 1 company, reconciling trial balance to 0 VND variance.
+  - *Option B (Multi-Entity Live Parallel Run)*: Dual-entry into legacy and new systems for 60 days across 3 entities.
+- **Criteria**: 2026-12-31 timeline constraint.
+- **Decision**: **Option A (Single Entity Historical Back-Testing)**.
+- **Owner**: CFO.
+- **Approval Date**: 2026-11-23.
 
 ---
 
-### D6: Target Go-Live Schedule vs. Regulatory Deadlines
-- **Problem Statement**: Align delivery with TT 99/2025/TT-BTC (effective 01/01/2026) and QĐ 1233 e-invoice deadline (01/01/2027).
-- **Determination**: **TARGET 2026-12-31 FOR GL CUTOVER; 2026-12-30 FOR E-INVOICE TEST CERTIFICATION**.
-  - Phase 1 General Ledger cutover scheduled for **2026-12-31**.
-  - Phase 2 E-Invoice provider integration certified in test environment by **2026-12-30**.
-- **Approved By**: Principal CFO & PO (2026-11-23).
-- **Status**: **APPROVED**.
+### D6: Go-Live Target Schedule
+- **Context & Problem**: Statutory cutover from Circular 200 to Circular 99 occurs on 01/01/2026 (or fiscal year beginning 2026). E-invoice transition deadline under QĐ 1233 is 01/01/2027.
+- **Decision**: **Phase 1 GL Go-Live target: 2026-12-31**; E-Invoice Provider Integration target: 2026-12-30.
+- **Owner**: PO.
+- **Approval Date**: 2026-11-23.
