@@ -275,6 +275,7 @@ proptest! {
             invoice_ref: None,
             created_by: Some("prop_actor".to_string()),
             approved_by: None,
+            status: None,
             lines: vec![
                 CreateVoucherLineRequest {
                     account_code: "1111".to_string(),

@@ -267,4 +267,104 @@ impl LedgerRepository {
         self.get_voucher(id)?
             .ok_or_else(|| AccountingError::VoucherNotFound(id.to_string()))
     }
+    /// Approves a DRAFT journal voucher, transitioning it to POSTED status and committing it to the general ledger.
+    /// Strictly enforces Segregation of Duties (SOD): the approver cannot be the voucher creator.
+    pub fn approve_voucher(
+        &self,
+        id: Uuid,
+        approver: &str,
+        client_ip: Option<&str>,
+    ) -> Result<JournalVoucher, AccountingError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        // 1. Fetch voucher header details
+        let (voucher_no, date_str, current_status, created_by): (String, String, String, String) =
+            tx.query_row(
+                "SELECT voucher_no, voucher_date, status, created_by FROM vouchers WHERE id = ?1",
+                params![id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?
+            .ok_or_else(|| AccountingError::VoucherNotFound(id.to_string()))?;
+
+        // 2. Check current status
+        if current_status == "POSTED" {
+            return Err(AccountingError::VoucherAlreadyApproved { voucher_no });
+        }
+        if current_status == "VOIDED" {
+            return Err(AccountingError::VoucherAlreadyVoided { voucher_no });
+        }
+
+        // 3. Enforce Segregation of Duties (SOD): Creator cannot approve own voucher
+        if created_by == approver {
+            return Err(AccountingError::CannotApproveOwnVoucher {
+                voucher_no,
+                creator: created_by,
+            });
+        }
+
+        // 4. Check period lock
+        let voucher_date = NaiveDate::parse_from_str(&date_str, "%Y-%m-%d").map_err(|e| {
+            AccountingError::DatabaseError(format!("Corrupt voucher date in database: {e}"))
+        })?;
+        let year = voucher_date.year();
+        let month = voucher_date.month();
+        let is_closed: bool = tx
+            .query_row(
+                "SELECT is_closed FROM accounting_periods WHERE year = ?1 AND month = ?2",
+                params![year, month],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(false);
+
+        if is_closed {
+            return Err(AccountingError::PeriodClosed { year, month });
+        }
+
+        // 5. Update status to POSTED with approver identity
+        tx.execute(
+            "UPDATE vouchers
+             SET status = 'POSTED',
+                 approved_by = ?1
+             WHERE id = ?2",
+            params![approver, id.to_string()],
+        )?;
+
+        // 6. Audit log entry
+        let now = chrono::Utc::now().to_rfc3339();
+        let audit = AuditLogEntry {
+            id: Uuid::new_v4(),
+            timestamp: now,
+            actor: approver.to_string(),
+            action: "APPROVE_VOUCHER".to_string(),
+            resource_type: "VOUCHER".to_string(),
+            resource_id: Some(voucher_no),
+            details: Some(format!("Approved by: {}", approver)),
+            client_ip: client_ip.map(|s| s.to_string()),
+        };
+
+        tx.execute(
+            "INSERT INTO audit_logs (id, timestamp, actor, action, resource_type, resource_id, details, client_ip)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                audit.id.to_string(),
+                audit.timestamp,
+                audit.actor,
+                audit.action,
+                audit.resource_type,
+                audit.resource_id,
+                audit.details,
+                audit.client_ip,
+            ],
+        )?;
+
+        tx.commit()?;
+
+        // 7. Reload and return approved voucher
+        drop(conn);
+        self.get_voucher(id)?
+            .ok_or_else(|| AccountingError::VoucherNotFound(id.to_string()))
+    }
 }

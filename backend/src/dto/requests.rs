@@ -22,6 +22,9 @@ pub struct CreateVoucherRequest {
     /// Optional approver / Chief Accountant identity.
     #[serde(default)]
     pub approved_by: Option<String>,
+    /// Optional status override: DRAFT or POSTED (defaults to DRAFT for workflow approval compliance).
+    #[serde(default)]
+    pub status: Option<crate::models::VoucherStatus>,
     /// Debit and credit line entries (minimum 2 lines).
     pub lines: Vec<CreateVoucherLineRequest>,
 }

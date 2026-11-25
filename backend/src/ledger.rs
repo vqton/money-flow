@@ -43,6 +43,12 @@ pub enum AccountingError {
     #[error("Voucher {voucher_no} is already voided")]
     VoucherAlreadyVoided { voucher_no: String },
 
+    #[error("Voucher {voucher_no} is already approved and posted")]
+    VoucherAlreadyApproved { voucher_no: String },
+
+    #[error("Cannot approve voucher {voucher_no}: creator '{creator}' cannot approve own voucher")]
+    CannotApproveOwnVoucher { voucher_no: String, creator: String },
+
     #[error("Cannot void voucher {voucher_no} in closed period {year}-{month:02}")]
     CannotVoidInClosedPeriod {
         voucher_no: String,

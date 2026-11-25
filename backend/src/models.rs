@@ -8,6 +8,8 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum VoucherStatus {
+    /// Initial draft status: unapproved, excluded from general ledger and financial reports.
+    Draft,
     /// Active, balanced, and posted into statutory general ledger balances.
     #[default]
     Posted,
@@ -19,6 +21,7 @@ pub enum VoucherStatus {
 impl std::fmt::Display for VoucherStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            VoucherStatus::Draft => write!(f, "DRAFT"),
             VoucherStatus::Posted => write!(f, "POSTED"),
             VoucherStatus::Voided => write!(f, "VOIDED"),
         }
@@ -30,6 +33,7 @@ impl std::str::FromStr for VoucherStatus {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_uppercase().as_str() {
+            "DRAFT" => Ok(VoucherStatus::Draft),
             "POSTED" => Ok(VoucherStatus::Posted),
             "VOIDED" => Ok(VoucherStatus::Voided),
             other => Err(format!("Unknown voucher status: {}", other)),

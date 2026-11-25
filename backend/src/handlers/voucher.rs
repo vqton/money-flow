@@ -62,15 +62,21 @@ pub async fn create_voucher(
         })
         .collect();
 
+    let status = req.status.unwrap_or(VoucherStatus::Posted);
+
     let voucher = JournalVoucher {
         id: voucher_id,
         voucher_no: req.voucher_no,
         voucher_date: req.voucher_date,
         description: req.description,
         invoice_ref: req.invoice_ref,
-        status: VoucherStatus::Posted,
+        status,
         created_by: user.claims.sub,
-        approved_by: req.approved_by,
+        approved_by: if status == VoucherStatus::Posted {
+            req.approved_by
+        } else {
+            None
+        },
         voided_at: None,
         voided_by: None,
         void_reason: None,
@@ -126,6 +132,20 @@ pub async fn void_voucher_handler(
 ) -> Result<Json<JournalVoucher>, ApiError> {
     let actor = user.claims.sub;
     let voucher = state.repo.void_voucher(id, &actor, &req.reason, None)?;
+    Ok(Json(voucher))
+}
+
+/// Approves a DRAFT journal voucher, transitioning it to POSTED status and committing it to the general ledger.
+/// Strictly enforces Segregation of Duties (SOD): only Controller/Admin can approve, and creator cannot approve own voucher.
+///
+/// Route: POST /api/v1/vouchers/{id}/approve
+pub async fn approve_voucher_handler(
+    RequireController(user): RequireController,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<JournalVoucher>, ApiError> {
+    let approver = user.claims.sub;
+    let voucher = state.repo.approve_voucher(id, &approver, None)?;
     Ok(Json(voucher))
 }
 

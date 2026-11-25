@@ -4261,3 +4261,171 @@ async fn test_e2e_backup_restore_drill_zero_diff() {
 
     let _ = std::fs::remove_dir_all(&temp_root);
 }
+
+#[tokio::test]
+async fn test_api_voucher_approval_workflow_and_sod() {
+    let app = setup_test_app();
+
+    let accountant_token = test_token("accountant_tuan", Role::Accountant);
+    let controller_token = test_token("controller_hien", Role::Controller);
+
+    // 1. Accountant creates a draft voucher
+    let payload = json!({
+        "voucher_no": "PKT-SOD-001",
+        "voucher_date": "2026-03-20",
+        "description": "Consulting fee draft",
+        "status": "DRAFT",
+        "lines": [
+            { "account_code": "642", "debit": "10000000", "credit": "0" },
+            { "account_code": "1121", "debit": "0", "credit": "10000000" }
+        ]
+    });
+
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/vouchers")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {}", accountant_token))
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let body_bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let created: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(created["status"], "DRAFT");
+    let v_id = created["id"].as_str().unwrap().to_string();
+
+    // 2. Draft does not impact trial balance
+    let tb_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/reports/trial-balance?date=2026-03-20")
+                .header("authorization", format!("Bearer {}", accountant_token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(tb_res.status(), StatusCode::OK);
+    let tb_bytes = axum::body::to_bytes(tb_res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let tb_val: serde_json::Value = serde_json::from_slice(&tb_bytes).unwrap();
+    assert_eq!(tb_val["total_debit"], "0");
+
+    // 3. SOD check: Accountant (creator) attempts to approve own voucher -> 403
+    let acc_approve_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/vouchers/{}/approve", v_id))
+                .header("authorization", format!("Bearer {}", accountant_token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(acc_approve_res.status(), StatusCode::FORBIDDEN);
+
+    // If a Controller creates a voucher, they still cannot approve their own voucher:
+    let ctrl_payload = json!({
+        "voucher_no": "PKT-SOD-002",
+        "voucher_date": "2026-03-21",
+        "description": "Controller draft entry",
+        "status": "DRAFT",
+        "lines": [
+            { "account_code": "642", "debit": "2000000", "credit": "0" },
+            { "account_code": "1111", "debit": "0", "credit": "2000000" }
+        ]
+    });
+    let ctrl_create_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/vouchers")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {}", controller_token))
+                .body(Body::from(ctrl_payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ctrl_create_res.status(), StatusCode::CREATED);
+    let ctrl_body = axum::body::to_bytes(ctrl_create_res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let ctrl_v: serde_json::Value = serde_json::from_slice(&ctrl_body).unwrap();
+    let ctrl_v_id = ctrl_v["id"].as_str().unwrap().to_string();
+
+    let ctrl_self_approve = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/vouchers/{}/approve", ctrl_v_id))
+                .header("authorization", format!("Bearer {}", controller_token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ctrl_self_approve.status(), StatusCode::FORBIDDEN);
+    let self_err_body = axum::body::to_bytes(ctrl_self_approve.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let err_json: serde_json::Value = serde_json::from_slice(&self_err_body).unwrap();
+    assert_eq!(err_json["error"], "CANNOT_APPROVE_OWN_VOUCHER");
+
+    // 4. Controller approves accountant's voucher -> 200 OK
+    let ok_approve = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/vouchers/{}/approve", v_id))
+                .header("authorization", format!("Bearer {}", controller_token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ok_approve.status(), StatusCode::OK);
+    let ok_body = axum::body::to_bytes(ok_approve.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let approved_v: serde_json::Value = serde_json::from_slice(&ok_body).unwrap();
+    assert_eq!(approved_v["status"], "POSTED");
+    assert_eq!(approved_v["approved_by"], "controller_hien");
+
+    // 5. Trial balance now reflects the approved voucher
+    let tb_after_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/reports/trial-balance?date=2026-03-20")
+                .header("authorization", format!("Bearer {}", accountant_token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(tb_after_res.status(), StatusCode::OK);
+    let tb_after_bytes = axum::body::to_bytes(tb_after_res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let tb_after_val: serde_json::Value = serde_json::from_slice(&tb_after_bytes).unwrap();
+    assert_eq!(tb_after_val["total_debit"], "10000000");
+}

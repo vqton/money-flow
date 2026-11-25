@@ -230,6 +230,75 @@ pub fn paths_core_json() -> Value {
                     }
                 }
             },
+            "/api/v1/vouchers/{id}/approve": {
+                "post": {
+                    "tags": ["Vouchers", "Approval"],
+                    "summary": "Approve Draft Voucher",
+                    "description": "Approves a DRAFT journal voucher, transitioning it to POSTED status and committing it to the general ledger. Enforces Segregation of Duties: only Controller/Admin can approve, and creator cannot approve own voucher.",
+                    "security": [
+                        { "bearerAuth": [] }
+                    ],
+                    "parameters": [
+                        {
+                            "name": "id",
+                            "in": "path",
+                            "required": true,
+                            "schema": { "type": "string", "format": "uuid" },
+                            "description": "UUID of the draft journal voucher to approve"
+                        }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Voucher successfully approved and posted",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/VoucherResponse" }
+                                }
+                            }
+                        },
+                        "400": {
+                            "description": "Voucher is already approved or voided",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
+                        "401": {
+                            "description": "Missing or invalid bearer token",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
+                        "403": {
+                            "description": "Forbidden: Requires Controller role or creator cannot approve own voucher",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
+                        "404": {
+                            "description": "Voucher not found",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
+                        "422": {
+                            "description": "Cannot approve voucher in a closed accounting period",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
             "/api/v1/vouchers/{id}/void": {
                 "post": {
                     "tags": ["Vouchers", "Audit"],

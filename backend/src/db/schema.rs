@@ -65,7 +65,7 @@ impl LedgerRepository {
                 voucher_date TEXT NOT NULL,
                 description TEXT NOT NULL,
                 invoice_ref TEXT,
-                status TEXT NOT NULL DEFAULT 'POSTED',
+                status TEXT NOT NULL DEFAULT 'DRAFT',
                 created_by TEXT NOT NULL DEFAULT 'system',
                 approved_by TEXT,
                 voided_at TEXT,
@@ -258,18 +258,35 @@ impl LedgerRepository {
             CREATE TRIGGER IF NOT EXISTS trg_vouchers_protect_update
             BEFORE UPDATE ON vouchers
             FOR EACH ROW
-            WHEN OLD.status != 'POSTED'
-              OR NEW.status != 'VOIDED'
-              OR NEW.id IS NOT OLD.id
-              OR NEW.voucher_no IS NOT OLD.voucher_no
-              OR NEW.voucher_date IS NOT OLD.voucher_date
-              OR NEW.description IS NOT OLD.description
-              OR NEW.invoice_ref IS NOT OLD.invoice_ref
-              OR NEW.created_by IS NOT OLD.created_by
-              OR NEW.approved_by IS NOT OLD.approved_by
-              OR NEW.created_at IS NOT OLD.created_at
+            WHEN NOT (
+              -- Allowed Transition 1: VOID an active POSTED voucher
+              (OLD.status = 'POSTED'
+               AND NEW.status = 'VOIDED'
+               AND NEW.id IS OLD.id
+               AND NEW.voucher_no IS OLD.voucher_no
+               AND NEW.voucher_date IS OLD.voucher_date
+               AND NEW.description IS OLD.description
+               AND NEW.invoice_ref IS OLD.invoice_ref
+               AND NEW.created_by IS OLD.created_by
+               AND NEW.approved_by IS OLD.approved_by
+               AND NEW.created_at IS OLD.created_at)
+              OR
+              -- Allowed Transition 2: APPROVE a DRAFT voucher to POSTED
+              (OLD.status = 'DRAFT'
+               AND NEW.status = 'POSTED'
+               AND NEW.id IS OLD.id
+               AND NEW.voucher_no IS OLD.voucher_no
+               AND NEW.voucher_date IS OLD.voucher_date
+               AND NEW.description IS OLD.description
+               AND NEW.invoice_ref IS OLD.invoice_ref
+               AND NEW.created_by IS OLD.created_by
+               AND NEW.voided_at IS NULL
+               AND NEW.voided_by IS NULL
+               AND NEW.void_reason IS NULL
+               AND NEW.created_at IS OLD.created_at)
+            )
             BEGIN
-                SELECT RAISE(ABORT, 'vouchers are immutable: only voiding transitions (status, voided_at, voided_by, void_reason) of POSTED vouchers are permitted');
+                SELECT RAISE(ABORT, 'vouchers are immutable: only voiding transitions (status, voided_at, voided_by, void_reason) of POSTED vouchers or DRAFT -> POSTED approval are permitted');
             END;
             ",
         )?;

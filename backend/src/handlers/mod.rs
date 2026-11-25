@@ -22,7 +22,8 @@ pub use reports_period::{
 };
 pub use system::{create_backup, restore_backup_handler};
 pub use voucher::{
-    create_voucher, get_voucher, list_audit_logs_handler, list_vouchers, void_voucher_handler,
+    approve_voucher_handler, create_voucher, get_voucher, list_audit_logs_handler, list_vouchers,
+    void_voucher_handler,
 };
 
 /// Health check handler returning service status and version.
@@ -92,6 +93,10 @@ pub fn create_app(state: Arc<AppState>) -> Router {
         .route("/swagger-ui", get(swagger_ui_handler))
         .route("/api/v1/vouchers", post(create_voucher).get(list_vouchers))
         .route("/api/v1/vouchers/{id}", get(get_voucher))
+        .route(
+            "/api/v1/vouchers/{id}/approve",
+            post(approve_voucher_handler),
+        )
         .route("/api/v1/vouchers/{id}/void", post(void_voucher_handler))
         .route("/api/v1/audit-logs", get(list_audit_logs_handler))
         .route("/api/v1/reports/trial-balance", get(get_trial_balance))

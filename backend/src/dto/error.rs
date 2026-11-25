@@ -38,6 +38,12 @@ pub enum ApiError {
     #[error("Forbidden: {0}")]
     Forbidden(String),
 
+    #[error("Cannot approve own voucher: {0}")]
+    CannotApproveOwnVoucher(String),
+
+    #[error("Voucher already approved: {0}")]
+    VoucherAlreadyApproved(String),
+
     #[error("Unknown account: {0}")]
     UnknownAccount(String),
 
@@ -55,6 +61,16 @@ impl IntoResponse for ApiError {
                 (StatusCode::UNAUTHORIZED, "UNAUTHORIZED", msg.as_str())
             }
             ApiError::Forbidden(ref msg) => (StatusCode::FORBIDDEN, "FORBIDDEN", msg.as_str()),
+            ApiError::CannotApproveOwnVoucher(ref msg) => (
+                StatusCode::FORBIDDEN,
+                "CANNOT_APPROVE_OWN_VOUCHER",
+                msg.as_str(),
+            ),
+            ApiError::VoucherAlreadyApproved(ref msg) => (
+                StatusCode::BAD_REQUEST,
+                "VOUCHER_ALREADY_APPROVED",
+                msg.as_str(),
+            ),
             ApiError::UnbalancedVoucher(ref msg) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "UNBALANCED_VOUCHER",
@@ -173,6 +189,19 @@ impl From<AccountingError> for ApiError {
             AccountingError::VoucherAlreadyVoided { voucher_no } => {
                 ApiError::VoucherAlreadyVoided(format!("Voucher {} is already voided", voucher_no))
             }
+            AccountingError::VoucherAlreadyApproved { voucher_no } => {
+                ApiError::VoucherAlreadyApproved(format!(
+                    "Voucher {} is already approved and posted",
+                    voucher_no
+                ))
+            }
+            AccountingError::CannotApproveOwnVoucher {
+                voucher_no,
+                creator,
+            } => ApiError::CannotApproveOwnVoucher(format!(
+                "Cannot approve voucher {}: creator '{}' cannot approve own voucher",
+                voucher_no, creator
+            )),
             AccountingError::CannotVoidInClosedPeriod {
                 voucher_no,
                 year,

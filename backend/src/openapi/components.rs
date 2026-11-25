@@ -88,7 +88,7 @@ pub fn components_json() -> Value {
                         "voucher_date": { "type": "string", "format": "date" },
                         "description": { "type": "string" },
                         "invoice_ref": { "type": "string", "nullable": true },
-                        "status": { "type": "string", "enum": ["POSTED", "VOIDED"], "example": "POSTED" },
+                        "status": { "type": "string", "enum": ["DRAFT", "POSTED", "VOIDED"], "example": "DRAFT" },
                         "created_by": { "type": "string", "example": "accountant_lan" },
                         "approved_by": { "type": "string", "nullable": true, "example": "cfo_minh" },
                         "voided_at": { "type": "string", "nullable": true, "format": "date-time" },

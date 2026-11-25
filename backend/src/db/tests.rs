@@ -1100,3 +1100,110 @@ fn test_restore_from_snapshot_lifecycle_and_rollback() {
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_voucher_draft_and_approval_workflow_with_sod() {
+    let conn = Connection::open_in_memory().unwrap();
+    let repo = LedgerRepository::new(conn);
+    repo.init_schema().unwrap();
+    let v_id = Uuid::new_v4();
+    let voucher = JournalVoucher {
+        id: v_id,
+        voucher_no: "PKT-DRAFT-01".to_string(),
+        voucher_date: NaiveDate::from_ymd_opt(2026, 3, 15).unwrap(),
+        description: "Draft stationery purchase".to_string(),
+        invoice_ref: None,
+        status: VoucherStatus::Draft,
+        created_by: "accountant_lan".to_string(),
+        approved_by: None,
+        voided_at: None,
+        voided_by: None,
+        void_reason: None,
+        created_at: "2026-03-15T08:00:00Z".to_string(),
+        lines: vec![
+            VoucherLine {
+                id: Uuid::new_v4(),
+                line_no: 1,
+                account_code: "642".to_string(),
+                debit: Decimal::from(5_000_000),
+                credit: Decimal::ZERO,
+                line_desc: None,
+            },
+            VoucherLine {
+                id: Uuid::new_v4(),
+                line_no: 2,
+                account_code: "1111".to_string(),
+                debit: Decimal::ZERO,
+                credit: Decimal::from(5_000_000),
+                line_desc: None,
+            },
+        ],
+    };
+
+    repo.save_voucher(&voucher).unwrap();
+
+    // 1. Verify draft voucher does NOT impact general ledger / trial balance
+    let balances = repo
+        .get_account_balances_for_range(
+            NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 12, 31).unwrap(),
+        )
+        .unwrap();
+    assert!(
+        balances.is_empty(),
+        "Draft vouchers must not reflect in trial balance"
+    );
+
+    // 2. SOD check: Creator (accountant_lan) cannot approve own voucher
+    let sod_err = repo
+        .approve_voucher(v_id, "accountant_lan", None)
+        .unwrap_err();
+    assert_eq!(
+        sod_err,
+        AccountingError::CannotApproveOwnVoucher {
+            voucher_no: "PKT-DRAFT-01".to_string(),
+            creator: "accountant_lan".to_string(),
+        }
+    );
+
+    // 3. Authorized Controller (controller_mai) approves voucher
+    let approved = repo
+        .approve_voucher(v_id, "controller_mai", Some("127.0.0.1"))
+        .unwrap();
+    assert_eq!(approved.status, VoucherStatus::Posted);
+    assert_eq!(approved.approved_by, Some("controller_mai".to_string()));
+
+    // 4. Trial balance now reflects the approved posted voucher
+    let balances_after = repo
+        .get_account_balances_for_range(
+            NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 12, 31).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(balances_after.len(), 2);
+    assert_eq!(
+        balances_after.get("642").unwrap().0,
+        Decimal::from(5_000_000)
+    );
+    assert_eq!(
+        balances_after.get("1111").unwrap().1,
+        Decimal::from(5_000_000)
+    );
+
+    // 5. Double approval rejected
+    let reapprove_err = repo.approve_voucher(v_id, "cfo_minh", None).unwrap_err();
+    assert_eq!(
+        reapprove_err,
+        AccountingError::VoucherAlreadyApproved {
+            voucher_no: "PKT-DRAFT-01".to_string()
+        }
+    );
+
+    // 6. Audit log contains APPROVE_VOUCHER
+    let logs = repo
+        .list_audit_logs(&crate::dto::AuditLogQuery::default())
+        .unwrap();
+    let approve_log = logs.iter().find(|l| l.action == "APPROVE_VOUCHER").unwrap();
+    assert_eq!(approve_log.actor, "controller_mai");
+    assert_eq!(approve_log.resource_id, Some("PKT-DRAFT-01".to_string()));
+}
