@@ -206,6 +206,23 @@ impl LedgerRepository {
             [],
         )?;
 
+        // 8. Voucher Attachments Table (metadata for supporting documents)
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS voucher_attachments (
+                id TEXT PRIMARY KEY,
+                voucher_id TEXT NOT NULL REFERENCES vouchers(id) ON DELETE CASCADE,
+                file_name TEXT NOT NULL,
+                content_type TEXT NOT NULL,
+                file_size INTEGER NOT NULL,
+                sha256_hash TEXT NOT NULL,
+                uploaded_by TEXT NOT NULL,
+                uploaded_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );",
+            [],
+        )?;
+        // Indexes for quick lookup
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_attachments_voucher ON voucher_attachments(voucher_id);", [], )?;
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_attachments_hash ON voucher_attachments(sha256_hash);", [], )?;
         // 7. Database Immutability Triggers (Financial Integrity & Non-Destructive Lifecycle)
         conn.execute_batch(
             "

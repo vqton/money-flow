@@ -74,7 +74,33 @@ pub struct JournalVoucher {
     pub lines: Vec<VoucherLine>,
 }
 
-/// Represents an individual debit or credit leg within a voucher (Dòng định khoản).
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json;
+    use uuid::Uuid;
+    use chrono::Utc;
+
+    #[test]
+    fn voucher_attachment_serde_roundtrip() {
+        let att = VoucherAttachment {
+            id: Uuid::new_v4(),
+            voucher_id: Uuid::new_v4(),
+            file_name: "invoice.pdf".to_string(),
+            content_type: "application/pdf".to_string(),
+            file_size: 12345,
+            sha256_hash: "deadbeef".repeat(8), // 64 hex chars
+            uploaded_by: "alice".to_string(),
+            uploaded_at: Utc::now().to_rfc3339(),
+        };
+        let json = serde_json::to_string(&att).expect("serialize");
+        let de: VoucherAttachment = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(att, de);
+    }
+}
+
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct VoucherLine {
     /// Unique identifier for the voucher leg.

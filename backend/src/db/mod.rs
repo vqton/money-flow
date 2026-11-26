@@ -16,7 +16,7 @@ pub mod period_repo;
 pub mod report_repo;
 pub mod schema;
 pub mod voucher_query;
-pub mod voucher_repo;
+pub mod attachment_repo;
 
 #[cfg(test)]
 mod tests;

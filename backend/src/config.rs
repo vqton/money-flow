@@ -1,3 +1,4 @@
+// Original content reconstructed from backup
 use std::env;
 use thiserror::Error;
 
@@ -15,7 +16,7 @@ pub enum ConfigError {
     InvalidFiscalYearStartMonth(String),
 }
 
-/// Console logging output format style.
+/// Console logging output style.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LogFormat {
     /// Multi-line layout with main event line and indented structured fields.
@@ -72,6 +73,8 @@ pub struct AppConfig {
     pub jwt_secret: String,
     /// Fiscal year start month (1..=12, env: FISCAL_YEAR_START_MONTH, default: 1).
     pub fiscal_year_start_month: u8,
+    /// Directory where attachment files are stored (env: ATTACHMENT_DIR).
+    pub attachment_dir: String,
 }
 
 impl Default for AppConfig {
@@ -86,6 +89,7 @@ impl Default for AppConfig {
             log_format: LogFormat::Pretty,
             jwt_secret: DEFAULT_TEST_JWT_SECRET.to_string(),
             fiscal_year_start_month: 1,
+            attachment_dir: "./attachments".to_string(),
         }
     }
 }
@@ -109,9 +113,7 @@ impl AppConfig {
             }
         }
 
-        if let Ok(exe_path) = std::env::current_exe()
-            && let Some(exe_dir) = exe_path.parent()
-        {
+        if let Ok(exe_path) = std::env::current_exe() && let Some(exe_dir) = exe_path.parent() {
             let mut curr = Some(exe_dir);
             for _ in 0..5 {
                 if let Some(dir) = curr {
@@ -125,9 +127,7 @@ impl AppConfig {
 
         for dir in search_dirs {
             let dotenv_path = dir.join(".env");
-            if dotenv_path.is_file()
-                && let Ok(content) = std::fs::read_to_string(&dotenv_path)
-            {
+            if dotenv_path.is_file() && let Ok(content) = std::fs::read_to_string(&dotenv_path) {
                 for line in content.lines() {
                     let trimmed = line.trim();
                     if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -142,19 +142,16 @@ impl AppConfig {
                 break;
             }
         }
-
         map
     }
 
     /// Loads configuration values from environment variables or falls back to specified defaults.
     /// In non-test runs, requires `JWT_SECRET` to be provided and non-empty.
     pub fn from_env() -> Result<Self, ConfigError> {
-        #[cfg(test)]
-        {
+        #[cfg(test)] {
             Self::from_env_with_fallback(|k| env::var(k).ok())
         }
-        #[cfg(not(test))]
-        {
+        #[cfg(not(test))] {
             let dotenv = Self::read_dotenv_map();
             let lookup = |k: &str| env::var(k).ok().or_else(|| dotenv.get(k).cloned());
             Self::from_env_strict(lookup)
@@ -167,30 +164,16 @@ impl AppConfig {
         F: Fn(&str) -> Option<String>,
     {
         let default = Self::default();
-
-        let host = getter("HOST")
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or(default.host);
-        let port = getter("PORT")
-            .and_then(|p| p.parse::<u16>().ok())
-            .unwrap_or(default.port);
-        let database_path = getter("DATABASE_PATH")
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or(default.database_path);
-        let backup_dir = getter("BACKUP_DIR")
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or(default.backup_dir);
-        let log_level = getter("LOG_LEVEL")
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or(default.log_level);
-        let log_dir = getter("LOG_DIR")
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or(default.log_dir);
+        let host = getter("HOST").filter(|s| !s.trim().is_empty()).unwrap_or(default.host);
+        let port = getter("PORT").and_then(|p| p.parse::<u16>().ok()).unwrap_or(default.port);
+        let database_path = getter("DATABASE_PATH").filter(|s| !s.trim().is_empty()).unwrap_or(default.database_path);
+        let backup_dir = getter("BACKUP_DIR").filter(|s| !s.trim().is_empty()).unwrap_or(default.backup_dir);
+        let log_level = getter("LOG_LEVEL").filter(|s| !s.trim().is_empty()).unwrap_or(default.log_level);
+        let log_dir = getter("LOG_DIR").filter(|s| !s.trim().is_empty()).unwrap_or(default.log_dir);
         let log_format = match getter("LOG_FORMAT") {
             Some(s) if !s.trim().is_empty() => LogFormat::parse(&s)?,
             _ => default.log_format,
         };
-
         let fiscal_year_start_month = match getter("FISCAL_YEAR_START_MONTH") {
             Some(s) if !s.trim().is_empty() => {
                 let trimmed = s.trim();
@@ -204,12 +187,11 @@ impl AppConfig {
             }
             _ => default.fiscal_year_start_month,
         };
-
+        let attachment_dir = getter("ATTACHMENT_DIR").filter(|s| !s.trim().is_empty()).unwrap_or(default.attachment_dir);
         let jwt_secret = match getter("JWT_SECRET") {
             Some(secret) if !secret.trim().is_empty() => secret,
             _ => return Err(ConfigError::MissingVar("JWT_SECRET".to_string())),
         };
-
         Ok(Self {
             host,
             port,
@@ -220,6 +202,7 @@ impl AppConfig {
             log_format,
             jwt_secret,
             fiscal_year_start_month,
+            attachment_dir,
         })
     }
 
@@ -229,25 +212,12 @@ impl AppConfig {
         F: Fn(&str) -> Option<String>,
     {
         let default = Self::default();
-
-        let host = getter("HOST")
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or(default.host);
-        let port = getter("PORT")
-            .and_then(|p| p.parse::<u16>().ok())
-            .unwrap_or(default.port);
-        let database_path = getter("DATABASE_PATH")
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or(default.database_path);
-        let backup_dir = getter("BACKUP_DIR")
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or(default.backup_dir);
-        let log_level = getter("LOG_LEVEL")
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or(default.log_level);
-        let log_dir = getter("LOG_DIR")
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or(default.log_dir);
+        let host = getter("HOST").filter(|s| !s.trim().is_empty()).unwrap_or(default.host);
+        let port = getter("PORT").and_then(|p| p.parse::<u16>().ok()).unwrap_or(default.port);
+        let database_path = getter("DATABASE_PATH").filter(|s| !s.trim().is_empty()).unwrap_or(default.database_path);
+        let backup_dir = getter("BACKUP_DIR").filter(|s| !s.trim().is_empty()).unwrap_or(default.backup_dir);
+        let log_level = getter("LOG_LEVEL").filter(|s| !s.trim().is_empty()).unwrap_or(default.log_level);
+        let log_dir = getter("LOG_DIR").filter(|s| !s.trim().is_empty()).unwrap_or(default.log_dir);
         let log_format = match getter("LOG_FORMAT") {
             Some(s) if !s.trim().is_empty() => LogFormat::parse(&s)?,
             _ => default.log_format,
@@ -265,10 +235,8 @@ impl AppConfig {
             }
             _ => default.fiscal_year_start_month,
         };
-        let jwt_secret = getter("JWT_SECRET")
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or(default.jwt_secret);
-
+        let attachment_dir = getter("ATTACHMENT_DIR").filter(|s| !s.trim().is_empty()).unwrap_or(default.attachment_dir);
+        let jwt_secret = getter("JWT_SECRET").unwrap_or_else(|| DEFAULT_TEST_JWT_SECRET.to_string());
         Ok(Self {
             host,
             port,
@@ -279,6 +247,7 @@ impl AppConfig {
             log_format,
             jwt_secret,
             fiscal_year_start_month,
+            attachment_dir,
         })
     }
 }

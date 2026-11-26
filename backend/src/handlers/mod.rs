@@ -14,7 +14,7 @@ use axum::{
 use serde_json::json;
 use std::sync::Arc;
 
-use crate::state::AppState;
+use crate::handlers::attachment::{upload_attachment, list_attachments, download_attachment};
 
 pub use reports_period::{
     close_period, get_balance_sheet, get_income_statement, get_trial_balance, list_periods,
@@ -109,7 +109,8 @@ pub fn create_app(state: Arc<AppState>) -> Router {
         .route("/api/v1/periods/close", post(close_period))
         .route("/api/v1/periods/reopen", post(reopen_period))
         .route("/api/v1/system/backup", post(create_backup))
-        .route("/api/v1/system/restore", post(restore_backup_handler))
+        .route("/api/v1/vouchers/{id}/attachments", post(upload_attachment).get(list_attachments))
+        .route("/api/v1/vouchers/{id}/attachments/{att_id}/download", get(download_attachment))
         .route(
             "/api/v1/accounts",
             get(crate::accounts::list_accounts).post(crate::accounts::create_account),
