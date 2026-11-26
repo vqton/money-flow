@@ -23,7 +23,51 @@ use std::sync::Arc;
 use tower::ServiceExt;
 use uuid::Uuid;
 
-/// Helper function to create an in-memory test application instance.
+
+#[tokio::test]
+async fn test_api_closed_period_write_returns_422_not_500() {
+    let app = setup_test_app();
+    // create and close period 2026-03 via repository directly
+    let conn = Connection::open_in_memory().unwrap();
+    let repo = LedgerRepository::new(conn);
+    repo.init_schema().unwrap();
+    let closing = JournalVoucher {
+        id: Uuid::new_v4(),
+        voucher_no: "KC-2026-03".to_string(),
+        voucher_date: NaiveDate::from_ymd_opt(2026, 3, 31).unwrap(),
+        description: "close".to_string(),
+        invoice_ref: None,
+        status: VoucherStatus::Posted,
+        created_by: "system".to_string(),
+        approved_by: None,
+        voided_at: None,
+        voided_by: None,
+        void_reason: None,
+        created_at: "2026-03-31T23:59:59Z".to_string(),
+        lines: vec![],
+    };
+    repo.close_period(2026, 3, &closing).unwrap();
+    // attempt POST voucher into closed period via API
+    let payload = json!({
+        "voucher_no": "V-2026-03-15",
+        "voucher_date": "2026-03-15",
+        "description": "test",
+        "lines": []
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/vouchers")
+        .header(header::AUTHORIZATION, format!("Bearer {}", accountant_token()))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(payload.to_string()))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let err: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(err["error"], "PERIOD_CLOSED");
+}
+
 fn setup_test_app() -> axum::Router {
     let conn = Connection::open_in_memory().expect("In-memory SQLite connection failed");
     let repo = LedgerRepository::new(conn);
