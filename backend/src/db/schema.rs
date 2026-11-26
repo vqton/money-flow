@@ -291,6 +291,12 @@ impl LedgerRepository {
             ",
         )?;
 
+        // ---- P0-4: Run period‑guard migration ----
+        let migration_path = std::path::Path::new("src/db/migrations/2026_11_26_001_add_period_guard_triggers.sql");
+        let sql = std::fs::read_to_string(migration_path)
+            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+        self.conn.lock().unwrap().execute_batch(&sql)?;
+        // ------------------------------------------------
         Ok(())
     }
 }

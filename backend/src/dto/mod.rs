@@ -8,6 +8,7 @@
 pub mod error;
 pub mod idempotency;
 pub mod requests;
+pub mod opening_balance;
 
 pub use error::ApiError;
 pub use idempotency::{IdempotencyKey, compute_request_hash, validate_idempotency_key};
