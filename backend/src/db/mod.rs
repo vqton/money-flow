@@ -21,6 +21,9 @@ pub mod attachment_repo;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod period_guard_tests;
+
 pub use disaster::{RestoreOutcome, execute_cli_restore};
 
 use crate::ledger::AccountingError;
